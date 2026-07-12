@@ -13,17 +13,23 @@ export interface TurnEvent {
 /** Runs one user turn to completion (possibly many tool round-trips),
  *  yielding events as they happen so the CLI can print live rather than
  *  waiting for the whole thing to finish. Mutates `history` in place so
- *  the caller's conversation state stays current across turns. */
+ *  the caller's conversation state stays current across turns.
+ *
+ *  `onToken` fires for every raw chunk the model streams back, before
+ *  any parsing - this is what lets the CLI show it's actually doing
+ *  something instead of sitting in silence for however many seconds a
+ *  turn takes. */
 export async function* runTurn(
   history: Message[],
   userMessage: string,
   tools: ToolExecutor,
+  onToken?: (chunk: string) => void,
 ): AsyncGenerator<TurnEvent> {
   history.push({ role: 'user', content: userMessage });
 
   for (let turn = 0; turn < config.maxTurns; turn++) {
     const prompt = renderPrompt(history, toolDefinitions);
-    const raw = await complete(prompt);
+    const raw = await complete(prompt, onToken);
     const parsed = parseResponse(raw);
 
     if (parsed.thinking) {

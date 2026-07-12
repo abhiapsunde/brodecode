@@ -2,8 +2,12 @@ import { config } from './config.js';
 
 /** Raw completion call against llama-server - not the OpenAI/Anthropic
  *  compatible chat routes. We control the exact prompt text end to end;
- *  nothing in between us and the model reformats or reinterprets it. */
-export async function complete(prompt: string): Promise<string> {
+ *  nothing in between us and the model reformats or reinterprets it.
+ *
+ *  Streams tokens via onToken as they arrive (so the CLI can show real,
+ *  live progress instead of silence followed by a wall of text), and
+ *  returns the full accumulated response once generation stops. */
+export async function complete(prompt: string, onToken?: (chunk: string) => void): Promise<string> {
   const res = await fetch(`${config.llamaServerUrl}/completion`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -11,11 +15,37 @@ export async function complete(prompt: string): Promise<string> {
       prompt,
       n_predict: config.maxTokensPerTurn,
       stop: ['<|im_end|>', '<|im_start|>'],
+      stream: true,
     }),
   });
-  if (!res.ok) {
+  if (!res.ok || !res.body) {
     throw new Error(`llama-server returned ${res.status}: ${await res.text()}`);
   }
-  const data = (await res.json()) as { content: string };
-  return data.content;
+
+  let full = '';
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by a blank line; each has one or more
+    // "data: {...}" lines. llama-server sends one JSON chunk per frame.
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      const line = frame.split('\n').find((l) => l.startsWith('data: '));
+      if (!line) continue;
+      const payload = JSON.parse(line.slice('data: '.length));
+      if (typeof payload.content === 'string') {
+        full += payload.content;
+        onToken?.(payload.content);
+      }
+    }
+  }
+
+  return full;
 }
