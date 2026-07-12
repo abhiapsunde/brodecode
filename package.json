@@ -1,0 +1,20 @@
+{
+  "name": "brodecode",
+  "version": "0.1.0",
+  "description": "A minimal coding harness built by hand for one model (Qwen3-14B via llama-server), no borrowed abstraction layer between the two.",
+  "type": "module",
+  "bin": {
+    "brodecode": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsc && node dist/cli.js"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.2"
+  }
+}
