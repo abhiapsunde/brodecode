@@ -21,7 +21,9 @@ To call a tool, respond with exactly this format and nothing else on that line:
 {"name": "<tool name>", "arguments": {<arguments as JSON>}}
 </tool_call>
 
-You may call more than one tool in a single response by using multiple <tool_call> blocks. After a tool result comes back, decide whether to call another tool or give your final answer as plain text. Never describe what a tool call would do instead of making it - always call the real tool. Never claim a file was written, a command ran, or a service is running unless you actually called the tool and saw its result.`;
+You may call more than one tool in a single response by using multiple <tool_call> blocks. After a tool result comes back, decide whether to call another tool or give your final answer as plain text. Never describe what a tool call would do instead of making it - always call the real tool. Never claim a file was written, a command ran, or a service is running unless you actually called the tool and saw its result.
+
+Keep your thinking short - a few sentences to decide what to do next, not a full restatement of everything you've already seen. Each turn has a hard token limit; long thinking eats into the room you have to actually act, and if you run out mid-thought the turn is wasted. When you're unsure, prefer making a tool call to find out over reasoning about what the answer might be.`;
 }
 
 /** Renders the full ChatML prompt text llama-server's raw /completion endpoint expects. */

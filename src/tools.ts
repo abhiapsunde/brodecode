@@ -85,7 +85,12 @@ function globToRegExp(pattern: string): RegExp {
   let out = '';
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
-    if (c === '*' && pattern[i + 1] === '*') {
+    if (c === '*' && pattern[i + 1] === '*' && pattern[i + 2] === '/') {
+      // "**/" - zero or more path segments, including none - so
+      // "**/*" matches root-level files too, not just nested ones.
+      out += '(?:.*/)?';
+      i += 2;
+    } else if (c === '*' && pattern[i + 1] === '*') {
       out += '.*';
       i++;
     } else if (c === '*') {
@@ -175,7 +180,17 @@ export class ToolExecutor {
     const content = await fs.readFile(resolved, 'utf-8');
     const occurrences = content.split(oldString).length - 1;
     if (occurrences === 0) {
-      return `error: old_string not found in ${filePath}`;
+      // A whitespace-insensitive check turns a dead end into an
+      // actionable hint. Trailing spaces on an otherwise "blank" line
+      // are invisible when a model re-reads a file and reproduces it
+      // from memory, but they break an exact match every time -
+      // observed directly: a model retried the identical failing
+      // old_string a dozen times in a row without this signal.
+      const normalize = (s: string) => s.split('\n').map((l) => l.trim()).join('\n');
+      if (normalize(content).includes(normalize(oldString))) {
+        return `error: old_string not found in ${filePath} - but it matches once whitespace is ignored, so the mismatch is likely trailing/leading spaces or indentation rather than the visible text. Re-read the file and copy the exact text around that area, including whitespace, instead of retyping it from memory.`;
+      }
+      return `error: old_string not found in ${filePath} - it must match the file's current exact content. Re-read the file if unsure, try a shorter/more distinctive anchor, or use write() to replace the whole file if repeated attempts keep failing.`;
     }
     if (occurrences > 1) {
       return `error: old_string appears ${occurrences} times in ${filePath} - must match exactly once`;

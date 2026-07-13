@@ -27,60 +27,71 @@ const PROMPT_TOKEN_BUDGET = config.contextSize - config.maxTokensPerTurn - 200;
 const INITIAL_TOOL_RESULT_CAP = 4000;
 const MIN_TOOL_RESULT_CAP = 200;
 
-/** Splits history into per-user-turn chunks (each starting at a
- *  'user' message) so old turns can be dropped as whole units -
- *  dropping a tool result without the assistant message that called
- *  it, or vice versa, would leave a dangling reference the model
- *  never asked for and can't make sense of. */
-function splitIntoTurns(history: Message[]): Message[][] {
-  const turns: Message[][] = [];
+/** Splits history into exchanges: each is either a lone user message,
+ *  or an assistant reply plus whatever tool results immediately
+ *  followed it. Finer-grained than splitting on user turns alone - a
+ *  single open-ended task ("fix the failing tests") can rack up a
+ *  dozen-plus tool-call round trips without the user ever sending a
+ *  second message, so turn-level dropping has nothing to drop in that
+ *  case even though the history has plenty of old, droppable
+ *  exchanges in it. Splitting an assistant message from its own tool
+ *  results, or vice versa, would leave a dangling reference the model
+ *  never asked for and can't make sense of - this keeps each pairing
+ *  intact as one unit. */
+function splitIntoExchanges(history: Message[]): Message[][] {
+  const exchanges: Message[][] = [];
   let current: Message[] = [];
   for (const m of history) {
-    if (m.role === 'user' && current.length > 0) {
-      turns.push(current);
+    if ((m.role === 'user' || m.role === 'assistant') && current.length > 0) {
+      exchanges.push(current);
       current = [];
     }
     current.push(m);
   }
-  if (current.length > 0) turns.push(current);
-  return turns;
+  if (current.length > 0) exchanges.push(current);
+  return exchanges;
 }
 
-/** Drops the oldest completed turns - never the turn in progress -
- *  until the rendered prompt fits the budget. If even the single
- *  in-progress turn is over budget on its own (one huge file read or
- *  command output), there's nothing older left to drop, so instead
- *  truncate that turn's own oversized tool results. Mutates `history`
- *  in place: once content is out of the model's context, there's no
- *  reason to keep pretending it's still part of the conversation. */
+/** Drops the oldest exchanges - always keeping the first (whatever
+ *  user message actually states the task at hand - losing that turns
+ *  "fix the tests" into aimless wandering) and the most recent ones -
+ *  until the rendered prompt fits the budget. If even just [first +
+ *  most recent] is still over budget, there's nothing structural left
+ *  to cut, so fall back to shrinking oversized tool results across
+ *  what remains. Mutates `history` in place: once content is out of
+ *  the model's context, there's no reason to keep pretending it's
+ *  still part of the conversation. */
 export function trimToBudget(history: Message[], tools: ToolDefinition[], workingDir: string): void {
-  const turns = splitIntoTurns(history);
+  const exchanges = splitIntoExchanges(history);
 
-  while (turns.length > 1 && estimateTokens(renderPrompt(turns.flat(), tools, workingDir)) > PROMPT_TOKEN_BUDGET) {
-    turns.shift();
+  while (
+    exchanges.length > 2 &&
+    estimateTokens(renderPrompt(exchanges.flat(), tools, workingDir)) > PROMPT_TOKEN_BUDGET
+  ) {
+    exchanges.splice(1, 1); // drop the oldest exchange after the first
   }
 
-  // A single turn can still be over budget on its own - several large
-  // reads/command outputs in one round-trip, say. One-shot truncation
-  // to a fixed size isn't guaranteed to be enough (many results each
-  // just under the cap still sum over budget), so shrink the cap and
-  // re-check until it actually fits or there's nothing left to cut.
+  // One-shot truncation to a fixed size isn't guaranteed to be enough
+  // (many results each just under the cap can still sum over budget),
+  // so shrink the cap and re-check until it actually fits or there's
+  // nothing left to cut.
   let cap = INITIAL_TOOL_RESULT_CAP;
   while (
-    turns.length === 1 &&
     cap >= MIN_TOOL_RESULT_CAP &&
-    estimateTokens(renderPrompt(turns[0], tools, workingDir)) > PROMPT_TOKEN_BUDGET
+    estimateTokens(renderPrompt(exchanges.flat(), tools, workingDir)) > PROMPT_TOKEN_BUDGET
   ) {
-    for (const m of turns[0]) {
-      if (m.role === 'tool' && m.content.length > cap) {
-        m.content = m.content.slice(0, cap) + '\n...(truncated - too large to fit in context)';
+    for (const group of exchanges) {
+      for (const m of group) {
+        if (m.role === 'tool' && m.content.length > cap) {
+          m.content = m.content.slice(0, cap) + '\n...(truncated - too large to fit in context)';
+        }
       }
     }
     cap = Math.floor(cap / 2);
   }
 
   history.length = 0;
-  history.push(...turns.flat());
+  history.push(...exchanges.flat());
 }
 
 /** Runs one user turn to completion (possibly many tool round-trips),
@@ -111,6 +122,18 @@ export async function* runTurn(
     }
 
     if (parsed.toolCalls.length === 0) {
+      if (!parsed.text.trim() && parsed.thinking) {
+        // No answer and no tool call, but there was reasoning - the
+        // turn got cut off mid-thought before it reached a
+        // conclusion, not a deliberate empty response. Recording it
+        // as "final" would show the user a blank result and dead-end
+        // the conversation. Keep the partial reasoning in history
+        // (closed off, as far as the model can tell) and let the next
+        // loop iteration try again instead - it still counts against
+        // maxTurns, so this can't loop forever.
+        history.push({ role: 'assistant', content: '', thinking: parsed.thinking });
+        continue;
+      }
       history.push({ role: 'assistant', content: parsed.text });
       yield { type: 'final', content: parsed.text };
       return;

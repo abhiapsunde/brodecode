@@ -51,18 +51,23 @@ async function main() {
   console.log(dim(`model runner: ${config.llamaServerUrl}\n`));
 
   const rl = readline.createInterface({ input: stdin, output: stdout });
-  let closed = false;
-  rl.on('close', () => { closed = true; });
 
-  for (;;) {
-    if (closed) break;
-    let userMessage: string;
-    try {
-      userMessage = await rl.question('> ');
-    } catch {
-      break; // stdin closed mid-question (e.g. piped input reached EOF)
+  // Deliberately not rl.question() in a loop: readline's 'close' event
+  // fires as soon as the input stream hits EOF, which for piped/non-TTY
+  // input happens almost immediately - long before a slow async model
+  // call for the first line finishes. Polling a "closed" flag at the
+  // top of the loop then races that, silently dropping every line
+  // after the first for any scripted/piped input (a live TTY never
+  // hits EOF mid-session, so this was invisible in normal manual use).
+  // The async-iterator form doesn't have that race: each iteration
+  // pulls exactly one already-buffered line, however long the
+  // previous one took to process.
+  process.stdout.write('> ');
+  for await (const userMessage of rl) {
+    if (!userMessage.trim()) {
+      process.stdout.write('> ');
+      continue;
     }
-    if (!userMessage.trim()) continue;
     if (userMessage.trim() === '/exit') break;
 
     // Live progress while the model is actually generating - the fix
@@ -114,6 +119,8 @@ async function main() {
       if (streaming) process.stdout.write('\r\x1b[2K');
       console.error(red(`turn failed: ${err instanceof Error ? err.message : String(err)}`));
     }
+
+    process.stdout.write('> ');
   }
 
   rl.close();

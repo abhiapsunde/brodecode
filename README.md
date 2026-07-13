@@ -81,6 +81,88 @@ every general-purpose harness tried earlier the same day: writing and
 reading back a file, and writing/starting/curling a real HTTP service.
 Both produced real, correct results with no fabrication.
 
-Not yet done: streaming output (currently waits for the full
-completion before parsing), token-budget-aware history truncation
-(currently just a hard turn-count limit), tests.
+Streaming output and token-budget-aware history truncation are both
+now in place (see "Driving log" below - both were built and hardened
+against real failures, not written speculatively). Still not done:
+automated tests (everything so far has been verified by hand, against
+real usage).
+
+## Driving log
+
+Bugs found and fixed by actually running the harness against a real,
+messy project and watching what happened, rather than reasoning about
+the code in the abstract. Kept here because several of these were
+non-obvious and worth not re-discovering later.
+
+**2026-07-12**
+
+- `glob("**/*")` never matched root-level files - the pattern compiled
+  to a regex requiring a literal `/`, so `**/*` only matched nested
+  files. A model asked "what's in this repo" on a project with files
+  in the root directory would see only its subdirectories and
+  conclude the wrong thing about what the project even was. Fixed by
+  giving `**/` its own case: zero-or-more path segments, including
+  none.
+- A response truncated mid-`<think>` block (hit the per-turn token
+  limit before closing the tag) fell through the parser's `<think>`
+  regex entirely and got dumped raw - literal `<think>` tag and all -
+  as if it were the final answer. Fixed by falling back to
+  "everything after the last `<think>`, unterminated" instead of
+  requiring a matched pair. Paired with a fix in `agent.ts`: when a
+  turn produces no answer and no tool call but does have reasoning,
+  that reasoning is kept as context and the loop continues instead of
+  showing the user a blank result.
+- History had no token-budget management at all - a multi-round
+  session (several file reads/edits/command outputs) would eventually
+  exceed `llama-server`'s context window and the whole turn would fail
+  outright with a 400, silently losing progress since the bloated
+  history never got cleaned up for the next attempt either. First fix
+  only dropped whole completed user-turns, which turned out to help
+  nothing for the actual common case: **one** open-ended task ("fix
+  the failing tests") racking up 15-20 tool-call rounds without a
+  second user message ever being sent. Rewrote trimming to work at
+  exchange granularity (assistant reply + its tool results as one
+  droppable unit) instead of turn granularity, always preserving the
+  first exchange (the task statement itself) and the most recent
+  ones, falling back to shrinking oversized individual tool results if
+  even that isn't enough.
+- The parser matched `<think>...</think>` and discarded the *entire*
+  matched span before ever looking for `<tool_call>` blocks - but
+  Qwen3 sometimes emits `<tool_call>` nested inside its own `<think>`
+  block, especially once a session has looped a couple of times on a
+  failing command. Those tool calls were silently thrown away with the
+  thinking text around them: the model had genuinely decided what to
+  do, and the harness just never did it, then re-prompted with no new
+  information and got the same "decision" again. This was the actual
+  root cause behind a session that looked like the model was
+  helplessly stuck repeating itself - it wasn't; the harness was
+  dropping its output on the floor. Fixed by extracting tool calls
+  from the full raw text first, before touching `<think>` at all.
+- Piped/non-interactive stdin only ever processed the first line. Node
+  readline's `close` event fires as soon as the input stream hits EOF,
+  which happens almost immediately for a pipe - and since that landed
+  *during* the long async model call for the first line, a
+  `closed`-flag check at the top of the loop killed the session before
+  ever asking for line two. Invisible in normal manual typing (a live
+  TTY doesn't hit EOF mid-session), but silently truncated any
+  scripted or automated use, including testing the harness itself.
+  Fixed by switching to `for await (const line of rl)`, which doesn't
+  have the race.
+- `edit()`'s "old_string not found" error gave no signal on *why*, so
+  a model whose guess was one wrong whitespace character away from
+  the real file kept retrying the identical failing edit. Added a
+  whitespace-insensitive fallback check: if the edit would match once
+  whitespace differences are ignored, say so explicitly, rather than
+  leaving the model to guess blindly.
+- Not a harness bug, but worth recording: the model can still lose the
+  thread on a genuinely hard, compounding task (a test file it had
+  already mangled across several earlier failed edits, combined with a
+  real breaking API change between chai-http v4 and v5) - it thrashed
+  between incompatible module systems and mutually exclusive
+  assumptions about the installed library's API rather than converging
+  and gave up at the turn limit. Every tool call it made was executed
+  correctly and reported accurately; the harness's job is to make sure
+  nothing gets in the model's way, not to make the model smarter than
+  it is. That's a real ceiling on what a 14B Q4 model can hold
+  together across ~20 tool-call rounds, not a defect in the
+  plumbing.
