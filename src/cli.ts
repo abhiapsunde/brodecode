@@ -142,9 +142,14 @@ async function main() {
     // redrawing on every single one just flickers past unreadably.
     // liveBuffer still accumulates every token immediately; only the
     // redraw itself is throttled, so what's shown is always accurate,
-    // just paced for a human to actually follow.
+    // just paced for a human to actually follow. 200ms (5x/sec) still
+    // felt like jittery flicker in practice - a sliding text window
+    // that jumps by an arbitrary chunk several times a second reads as
+    // motion, not text. Slower, steadier updates are easier to
+    // actually track than fast ones, even though each jump covers
+    // more new text.
     let lastRenderAt = 0;
-    const RENDER_INTERVAL_MS = 200;
+    const RENDER_INTERVAL_MS = 600;
     const onToken = (chunk: string) => {
       liveBuffer += chunk;
       streaming = true;
