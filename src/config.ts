@@ -6,4 +6,9 @@ export const config = {
   llamaServerUrl: process.env.BRODECODE_SERVER_URL ?? 'http://10.9.9.185:8090',
   maxTurns: 20,
   maxTokensPerTurn: 4096,
+  // Must match llama-server's own --ctx-size (see lallan-u24/README.md
+  // in the homelab repo - currently 8192, reduced from a planned 32768
+  // after a VRAM OOM at full context). History gets trimmed to fit
+  // under this before every prompt render - see agent.ts.
+  contextSize: 8192,
 };

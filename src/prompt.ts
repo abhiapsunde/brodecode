@@ -4,11 +4,14 @@ import type { Message, ToolDefinition } from './types.js';
 // ~25 tools and ~100KB - that's the thing that overwhelmed every local
 // model tried today, not model capability. This is the opposite bet:
 // exactly six tools, described once, briefly, and nothing else.
-function buildSystemPrompt(tools: ToolDefinition[]): string {
+function buildSystemPrompt(tools: ToolDefinition[], workingDir: string): string {
   const toolList = tools
     .map((t) => `- ${t.name}(${JSON.stringify(t.parameters)}): ${t.description}`)
     .join('\n');
   return `You are a coding assistant with direct access to a project's files and a shell. You can call tools to accomplish tasks.
+
+Your entire scope is this one directory: ${workingDir}
+When the user says "this repo", "this project", or asks what's in "here", they always mean that directory and nothing else - not wherever this program happens to be installed, not any other project you may know about. All file paths in tool calls are relative to it unless you give an absolute path.
 
 Available tools:
 ${toolList}
@@ -22,9 +25,9 @@ You may call more than one tool in a single response by using multiple <tool_cal
 }
 
 /** Renders the full ChatML prompt text llama-server's raw /completion endpoint expects. */
-export function renderPrompt(messages: Message[], tools: ToolDefinition[]): string {
+export function renderPrompt(messages: Message[], tools: ToolDefinition[], workingDir: string): string {
   const parts: string[] = [];
-  parts.push(`<|im_start|>system\n${buildSystemPrompt(tools)}<|im_end|>`);
+  parts.push(`<|im_start|>system\n${buildSystemPrompt(tools, workingDir)}<|im_end|>`);
 
   for (const m of messages) {
     if (m.role === 'user') {

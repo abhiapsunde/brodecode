@@ -73,6 +73,14 @@ export const toolDefinitions: ToolDefinition[] = [
   },
 ];
 
+// Matches what ripgrep/fd/git treat as noise by default - without this,
+// "what's in this repo" on any real Node project returns hundreds of
+// node_modules lines before ever reaching the actual source files.
+const IGNORED_DIR_SEGMENTS = new Set(['node_modules', '.git', 'dist', 'build', '.cache']);
+function isIgnoredPath(relPath: string): boolean {
+  return relPath.split(path.sep).some((segment) => IGNORED_DIR_SEGMENTS.has(segment));
+}
+
 function globToRegExp(pattern: string): RegExp {
   let out = '';
   for (let i = 0; i < pattern.length; i++) {
@@ -94,7 +102,7 @@ function globToRegExp(pattern: string): RegExp {
 }
 
 export class ToolExecutor {
-  private readonly workingDir: string;
+  readonly workingDir: string;
   private readonly readFiles = new Set<string>();
 
   constructor(workingDir: string) {
@@ -203,7 +211,7 @@ export class ToolExecutor {
     const matches = entries
       .filter((e) => e.isFile())
       .map((e) => path.relative(this.workingDir, path.join(e.parentPath ?? this.workingDir, e.name)))
-      .filter((rel) => regex.test(rel));
+      .filter((rel) => !isIgnoredPath(rel) && regex.test(rel));
     return matches.length ? matches.join('\n') : '(no matches)';
   }
 
@@ -215,6 +223,7 @@ export class ToolExecutor {
     for (const e of entries) {
       if (!e.isFile()) continue;
       const full = path.join(e.parentPath ?? startDir, e.name);
+      if (isIgnoredPath(path.relative(this.workingDir, full))) continue;
       let content: string;
       try {
         content = await fs.readFile(full, 'utf-8');

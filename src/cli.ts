@@ -25,15 +25,17 @@ const THINKING_PREVIEW_CHARS = 180;
 const selfDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 async function resolveWorkingDir(): Promise<string> {
+  // Standard CLI convention (matches git, npm, etc.): operate on wherever
+  // you launched from, unless told otherwise with an explicit argument.
+  // The one guardrail that actually matters is refusing to ever run
+  // against brodecode's own repo, whether that came from the default or
+  // an explicit path - that's the specific accident this is preventing,
+  // not "no default at all".
   const arg = process.argv[2];
-  if (!arg) {
-    console.error(red('usage: brodecode <working-directory>'));
-    console.error(dim('a working directory is required - it is never inferred from where you happen to be running this from.'));
-    process.exit(1);
-  }
-  const resolved = path.resolve(arg);
+  const resolved = path.resolve(arg ?? process.cwd());
   if (resolved === selfDir || resolved.startsWith(selfDir + path.sep)) {
     console.error(red(`refusing to run against ${resolved} - that's inside brodecode's own repo, not a project directory.`));
+    console.error(dim('cd somewhere else first, or pass an explicit path: brodecode <working-directory>'));
     process.exit(1);
   }
   await fs.mkdir(resolved, { recursive: true });
