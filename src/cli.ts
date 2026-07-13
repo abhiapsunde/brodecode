@@ -138,9 +138,19 @@ async function main() {
     let spinnerIdx = 0;
     let liveBuffer = '';
     let streaming = false;
+    // Tokens arrive far faster than anyone can read (~60-70/s here) -
+    // redrawing on every single one just flickers past unreadably.
+    // liveBuffer still accumulates every token immediately; only the
+    // redraw itself is throttled, so what's shown is always accurate,
+    // just paced for a human to actually follow.
+    let lastRenderAt = 0;
+    const RENDER_INTERVAL_MS = 200;
     const onToken = (chunk: string) => {
       liveBuffer += chunk;
       streaming = true;
+      const now = Date.now();
+      if (now - lastRenderAt < RENDER_INTERVAL_MS) return;
+      lastRenderAt = now;
       spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
       const preview = liveBuffer.replace(/\s+/g, ' ').trim().slice(-LIVE_PREVIEW_CHARS);
       process.stdout.write(`\r${dim(`${spinnerFrames[spinnerIdx]} ${preview}`)}`);
