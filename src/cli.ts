@@ -29,7 +29,6 @@ function renderMarkdown(text: string): string {
 }
 
 const TOOL_CALL_PREVIEW_CHARS = 200;
-const LIVE_PREVIEW_CHARS = 100;
 const BASH_COMMAND_PREVIEW_CHARS = 150;
 
 /** Per-tool-aware one-line summary for the live terminal display -
@@ -136,29 +135,34 @@ async function main() {
     // below, which deliberately prints nothing permanent).
     const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let spinnerIdx = 0;
-    let liveBuffer = '';
     let streaming = false;
-    // Tokens arrive far faster than anyone can read (~60-70/s here) -
-    // redrawing on every single one just flickers past unreadably.
-    // liveBuffer still accumulates every token immediately; only the
-    // redraw itself is throttled, so what's shown is always accurate,
-    // just paced for a human to actually follow. 200ms (5x/sec) still
-    // felt like jittery flicker in practice - a sliding text window
-    // that jumps by an arbitrary chunk several times a second reads as
-    // motion, not text. Slower, steadier updates are easier to
-    // actually track than fast ones, even though each jump covers
-    // more new text.
+    // Two rounds of just tuning the interval (200ms, then 600ms)
+    // still read as uncomfortable to look at - the actual problem
+    // wasn't speed, it was a *sliding* window: every redraw showed a
+    // different arbitrary substring, so the start of the line jumped
+    // around unpredictably each time, which is what reads as motion/
+    // flicker rather than text. Fix: stop sliding. Text only ever
+    // grows left-to-right (pure append, nothing at the start ever
+    // changes) until it hits a width cap, then does one clean reset -
+    // like a page turning, not a window shuffling. Growth-only redraws
+    // are calm enough to redraw fairly often; the only "jump" is the
+    // occasional full reset, which is rare and reads as a clean
+    // transition instead of constant jitter.
+    let currentPage = '';
     let lastRenderAt = 0;
-    const RENDER_INTERVAL_MS = 600;
+    const RENDER_INTERVAL_MS = 300;
+    const PAGE_WIDTH_CHARS = 100;
     const onToken = (chunk: string) => {
-      liveBuffer += chunk;
       streaming = true;
+      currentPage += chunk.replace(/\s+/g, ' ');
+      if (currentPage.length > PAGE_WIDTH_CHARS) {
+        currentPage = '';
+      }
       const now = Date.now();
       if (now - lastRenderAt < RENDER_INTERVAL_MS) return;
       lastRenderAt = now;
       spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
-      const preview = liveBuffer.replace(/\s+/g, ' ').trim().slice(-LIVE_PREVIEW_CHARS);
-      process.stdout.write(`\r${dim(`${spinnerFrames[spinnerIdx]} ${preview}`)}`);
+      process.stdout.write(`\r\x1b[2K${dim(`${spinnerFrames[spinnerIdx]} ${currentPage}`)}`);
     };
 
     try {
@@ -166,7 +170,7 @@ async function main() {
         if (streaming) {
           process.stdout.write('\r\x1b[2K'); // clear the spinner line entirely
           streaming = false;
-          liveBuffer = '';
+          currentPage = '';
         }
         await logger.logEvent(event);
         switch (event.type) {

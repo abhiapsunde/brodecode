@@ -143,6 +143,15 @@ export class ToolExecutor {
   // burning the turn budget on a call that already proved it doesn't
   // work.
   private readonly failedEdits = new Set<string>();
+  // Bumped on every successful write/edit. Paired with
+  // bashRunAtMutation below to catch a different loop: re-running the
+  // exact same read-only command (a test/coverage check, say) with
+  // nothing having changed since the last time - observed directly,
+  // six times in a row with zero edits in between, burning an entire
+  // turn budget on a command that could not possibly give a new
+  // answer.
+  private mutationCount = 0;
+  private readonly bashRunAtMutation = new Map<string, number>();
 
   constructor(workingDir: string) {
     this.workingDir = path.resolve(workingDir);
@@ -205,6 +214,7 @@ export class ToolExecutor {
     if (verify !== content) {
       return `error: write to ${filePath} did not verify - disk content does not match what was written`;
     }
+    this.mutationCount++;
     return `wrote ${verify.length} bytes to ${filePath}, verified by reading it back`;
   }
 
@@ -245,22 +255,36 @@ export class ToolExecutor {
     if (verify !== updated) {
       return `error: edit to ${filePath} did not verify - disk content does not match what was written`;
     }
+    this.mutationCount++;
     return `edited ${filePath}, verified by reading it back`;
   }
 
   private async bash(command: string): Promise<string> {
+    // A repeat of the exact same command, with no file change since
+    // the last time it ran, cannot produce a different result -
+    // observed directly, six times in a row (a coverage check),
+    // burning an entire turn budget on nothing. This doesn't block
+    // the repeat (re-running a command is often exactly right, e.g.
+    // after a real edit), it just makes the "nothing changed" case
+    // explicit instead of silently returning the same output again.
+    const isNoOpRepeat = this.bashRunAtMutation.get(command) === this.mutationCount;
+    this.bashRunAtMutation.set(command, this.mutationCount);
+    const repeatNote = isNoOpRepeat
+      ? '\n\n(note: this exact command was already run since the last file change - the result above is the same as last time and running it again without changing any files first will not produce a different one. If this result isn\'t what you want, change the code or tests, then re-run it.)'
+      : '';
+
     try {
       const { stdout, stderr } = await execAsync(command, {
         cwd: this.workingDir,
         timeout: 30_000,
         maxBuffer: 1024 * 1024,
       });
-      return `stdout:\n${stdout}${stderr ? `\nstderr:\n${stderr}` : ''}`;
+      return `stdout:\n${stdout}${stderr ? `\nstderr:\n${stderr}` : ''}${repeatNote}`;
     } catch (err: any) {
       // Real command failures are real information the model needs to see,
       // not something to swallow into a generic "it worked" - this is
       // exactly the kind of result today's failures never actually got.
-      return `command failed (exit ${err.code ?? 'unknown'}):\nstdout:\n${err.stdout ?? ''}\nstderr:\n${err.stderr ?? ''}`;
+      return `command failed (exit ${err.code ?? 'unknown'}):\nstdout:\n${err.stdout ?? ''}\nstderr:\n${err.stderr ?? ''}${repeatNote}`;
     }
   }
 

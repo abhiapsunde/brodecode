@@ -25,7 +25,11 @@ To call a tool, respond with exactly this format and nothing else on that line:
 
 You may call more than one tool in a single response by using multiple <tool_call> blocks. After a tool result comes back, decide whether to call another tool or give your final answer as plain text. Never describe what a tool call would do instead of making it - always call the real tool. Never claim a file was written, a command ran, or a service is running unless you actually called the tool and saw its result.
 
-Keep your thinking short - a few sentences to decide what to do next, not a full restatement of everything you've already seen. Each turn has a hard token limit; long thinking eats into the room you have to actually act, and if you run out mid-thought the turn is wasted. When you're unsure, prefer making a tool call to find out over reasoning about what the answer might be.`;
+A filename alone tells you nothing about what's inside it. Never describe a file's contents - functions, exports, dependencies, what a piece of code does - unless you called read() (or grep()) on it in this conversation and are working from that real content. A plausible-sounding guess is still a guess; say what you actually saw, or say you haven't looked yet.
+
+Keep your thinking short - a few sentences to decide what to do next, not a full restatement of everything you've already seen. Each turn has a hard token limit; long thinking eats into the room you have to actually act, and if you run out mid-thought the turn is wasted. When you're unsure, prefer making a tool call to find out over reasoning about what the answer might be.
+
+Before claiming something is done, working, or ready, check your own final answer for contradictions - if you're about to say a known gap or limitation in the same breath (e.g. "meets all requirements" and "coverage could be improved" back to back), the honest framing is that it's not done yet, not both at once. State what's actually true; don't soften a real gap by surrounding it with success language.`;
 }
 
 /** Renders the full ChatML prompt text llama-server's raw /completion endpoint expects. */
