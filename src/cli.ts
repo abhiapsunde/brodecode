@@ -8,6 +8,7 @@ import type { Message } from './types.js';
 import { runTurn } from './agent.js';
 import { ToolExecutor } from './tools.js';
 import { config } from './config.js';
+import { SessionLogger } from './logger.js';
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
@@ -47,8 +48,12 @@ async function main() {
   const tools = new ToolExecutor(workingDir);
   const history: Message[] = [];
 
+  const logger = new SessionLogger(workingDir, process.env.BRODECODE_SESSION_LABEL);
+  await logger.init(workingDir, process.env.BRODECODE_SESSION_LABEL);
+
   console.log(`brodecode - working dir: ${workingDir}`);
-  console.log(dim(`model runner: ${config.llamaServerUrl}\n`));
+  console.log(dim(`model runner: ${config.llamaServerUrl}`));
+  console.log(dim(`session log: ${logger.filePath}\n`));
 
   const rl = readline.createInterface({ input: stdin, output: stdout });
 
@@ -69,6 +74,8 @@ async function main() {
       continue;
     }
     if (userMessage.trim() === '/exit') break;
+
+    await logger.logUser(userMessage);
 
     // Live progress while the model is actually generating - the fix
     // for "is it working, stuck, or failed, no idea". A single
@@ -93,6 +100,7 @@ async function main() {
           streaming = false;
           tokenCount = 0;
         }
+        await logger.logEvent(event);
         switch (event.type) {
           case 'thinking': {
             const preview = event.content.length > THINKING_PREVIEW_CHARS
@@ -117,7 +125,9 @@ async function main() {
       }
     } catch (err) {
       if (streaming) process.stdout.write('\r\x1b[2K');
-      console.error(red(`turn failed: ${err instanceof Error ? err.message : String(err)}`));
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(red(`turn failed: ${message}`));
+      await logger.logError(message);
     }
 
     process.stdout.write('> ');
