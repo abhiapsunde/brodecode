@@ -13,6 +13,8 @@ function buildSystemPrompt(tools: ToolDefinition[], workingDir: string): string 
 Your entire scope is this one directory: ${workingDir}
 When the user says "this repo", "this project", or asks what's in "here", they always mean that directory and nothing else - not wherever this program happens to be installed, not any other project you may know about. All file paths in tool calls are relative to it unless you give an absolute path.
 
+Before reading or editing a specific file, confirm it actually exists with glob if you haven't already seen it - don't guess a path or a language/framework from the project's name alone (a project called "todo-cli" is not necessarily Ruby, "-cli" is not a language). A single directory listing is cheap; several rounds of guessing wrong paths is not.
+
 Available tools:
 ${toolList}
 

@@ -1,4 +1,4 @@
-import type { Message, ToolDefinition } from './types.js';
+import type { Message, ToolCall, ToolDefinition } from './types.js';
 import { renderPrompt } from './prompt.js';
 import { complete } from './runner.js';
 import { parseResponse } from './parse.js';
@@ -8,6 +8,11 @@ import { config } from './config.js';
 export interface TurnEvent {
   type: 'thinking' | 'tool_call' | 'tool_result' | 'final';
   content: string;
+  // Only set for 'tool_call' - the raw call, so a display layer can
+  // build a per-tool-aware summary (e.g. "write(file.js, 635 bytes)")
+  // instead of the flattened content string, which for write/edit
+  // carries a full file as an escaped JSON argument.
+  toolCall?: ToolCall;
 }
 
 // Rough chars-per-token estimate, biased conservative (code/JSON tends
@@ -147,7 +152,7 @@ export async function* runTurn(
     });
 
     for (const call of parsed.toolCalls) {
-      yield { type: 'tool_call', content: `${call.name}(${JSON.stringify(call.arguments)})` };
+      yield { type: 'tool_call', content: `${call.name}(${JSON.stringify(call.arguments)})`, toolCall: call };
       const result = await tools.execute(call);
       yield { type: 'tool_result', content: result };
       history.push({ role: 'tool', toolCallId: call.id, content: result });

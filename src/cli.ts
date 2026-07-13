@@ -4,7 +4,7 @@ import { stdin, stdout } from 'node:process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Message } from './types.js';
+import type { Message, ToolCall } from './types.js';
 import { runTurn } from './agent.js';
 import { ToolExecutor } from './tools.js';
 import { config } from './config.js';
@@ -17,6 +17,43 @@ const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
 
 const THINKING_PREVIEW_CHARS = 180;
+const TOOL_CALL_PREVIEW_CHARS = 200;
+const BASH_COMMAND_PREVIEW_CHARS = 150;
+
+/** Per-tool-aware one-line summary for the live terminal display -
+ *  write/edit carry a full file's content as a JSON argument, so
+ *  blindly printing JSON.stringify(call) either dumps a huge escaped
+ *  blob or gets truncated mid-string. Show what a human actually
+ *  wants to know at a glance (which file, how much changed) instead.
+ *  The full call always still goes to the session log unabridged. */
+function formatToolCall(call: ToolCall): string {
+  const args = call.arguments as Record<string, unknown>;
+  switch (call.name) {
+    case 'write':
+      return `write(${args.file_path}, ${String(args.content ?? '').length} bytes)`;
+    case 'edit':
+      return `edit(${args.file_path}, ${String(args.old_string ?? '').length} chars -> ${String(args.new_string ?? '').length} chars)`;
+    case 'bash': {
+      const command = String(args.command ?? '');
+      const preview = command.length > BASH_COMMAND_PREVIEW_CHARS
+        ? command.slice(0, BASH_COMMAND_PREVIEW_CHARS) + '...'
+        : command;
+      return `bash(${preview})`;
+    }
+    case 'read':
+      return `read(${args.file_path})`;
+    case 'glob':
+      return `glob(${args.pattern})`;
+    case 'grep':
+      return `grep(${args.pattern}${args.path ? `, ${args.path}` : ''})`;
+    default: {
+      const raw = `${call.name}(${JSON.stringify(call.arguments)})`;
+      return raw.length > TOOL_CALL_PREVIEW_CHARS
+        ? raw.slice(0, TOOL_CALL_PREVIEW_CHARS) + `... (${raw.length - TOOL_CALL_PREVIEW_CHARS} more chars)`
+        : raw;
+    }
+  }
+}
 
 /** brodecode's own repo dir, so we can refuse to ever run against it -
  *  the accident this is guarding against: running `node dist/cli.js`
@@ -109,9 +146,16 @@ async function main() {
             console.log(dim(`[thinking] ${preview.replace(/\n+/g, ' ')}`));
             break;
           }
-          case 'tool_call':
-            console.log(yellow(`→ ${event.content}`));
+          case 'tool_call': {
+            // write()/edit() calls carry full file content as a JSON
+            // argument - unlike tool_result, this had no cap at all,
+            // so a single write() could dump a thousand-plus-char
+            // wall of escaped JSON onto one terminal line. The full
+            // call still goes to the session log unabridged.
+            const preview = event.toolCall ? formatToolCall(event.toolCall) : event.content;
+            console.log(yellow(`→ ${preview}`));
             break;
+          }
           case 'tool_result': {
             const lines = event.content.split('\n');
             const preview = lines.slice(0, 5).join('\n');
