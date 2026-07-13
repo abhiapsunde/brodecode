@@ -16,8 +16,20 @@ const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
 
-const THINKING_PREVIEW_CHARS = 180;
+/** The model writes real Markdown in its final answer (**bold**,
+ *  `code`) - printed raw, that's just literal asterisks and
+ *  backticks cluttering the terminal. Renders the common cases as
+ *  ANSI instead. Assumes it's used inside an outer green(...) wrap
+ *  (the final-answer case below) - resets restore green rather than
+ *  the terminal default, so the surrounding color isn't cut short. */
+function renderMarkdown(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '\x1b[1m$1\x1b[22m')
+    .replace(/`([^`]+)`/g, '\x1b[36m$1\x1b[32m');
+}
+
 const TOOL_CALL_PREVIEW_CHARS = 200;
+const LIVE_PREVIEW_CHARS = 100;
 const BASH_COMMAND_PREVIEW_CHARS = 150;
 
 /** Per-tool-aware one-line summary for the live terminal display -
@@ -117,17 +129,21 @@ async function main() {
     // Live progress while the model is actually generating - the fix
     // for "is it working, stuck, or failed, no idea". A single
     // overwriting status line driven by real streamed tokens (so it's
-    // never lying about progress), not a dump of the raw stream -
-    // that turned out to be its own kind of noisy and hard to read.
+    // never lying about progress), showing a live tail of what's
+    // actually being generated rather than just a token count - this
+    // is also where thinking becomes visible: live, while it's
+    // happening, then gone once it resolves (see the 'thinking' case
+    // below, which deliberately prints nothing permanent).
     const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let spinnerIdx = 0;
-    let tokenCount = 0;
+    let liveBuffer = '';
     let streaming = false;
-    const onToken = () => {
-      tokenCount++;
+    const onToken = (chunk: string) => {
+      liveBuffer += chunk;
       streaming = true;
       spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
-      process.stdout.write(`\r${dim(`${spinnerFrames[spinnerIdx]} generating... (${tokenCount} tokens)`)}`);
+      const preview = liveBuffer.replace(/\s+/g, ' ').trim().slice(-LIVE_PREVIEW_CHARS);
+      process.stdout.write(`\r${dim(`${spinnerFrames[spinnerIdx]} ${preview}`)}`);
     };
 
     try {
@@ -135,17 +151,21 @@ async function main() {
         if (streaming) {
           process.stdout.write('\r\x1b[2K'); // clear the spinner line entirely
           streaming = false;
-          tokenCount = 0;
+          liveBuffer = '';
         }
         await logger.logEvent(event);
         switch (event.type) {
-          case 'thinking': {
-            const preview = event.content.length > THINKING_PREVIEW_CHARS
-              ? event.content.slice(0, THINKING_PREVIEW_CHARS).trim() + '...'
-              : event.content;
-            console.log(dim(`[thinking] ${preview.replace(/\n+/g, ' ')}`));
+          case 'thinking':
+            // Deliberately no permanent output here. Thinking was
+            // already visible live while it streamed (onToken's tail
+            // preview, above) - printing it again now would mean
+            // every turn leaves a reasoning transcript in scrollback
+            // forever, which is exactly the "too much stays on
+            // screen" complaint this is fixing. Reasoning is
+            // transient by nature; tool calls, results, and the final
+            // answer are what's durable. The full text is still in
+            // the session log if it's ever needed later.
             break;
-          }
           case 'tool_call': {
             // write()/edit() calls carry full file content as a JSON
             // argument - unlike tool_result, this had no cap at all,
@@ -163,7 +183,7 @@ async function main() {
             break;
           }
           case 'final':
-            console.log(`\n${green(event.content)}\n`);
+            console.log(`\n${green(renderMarkdown(event.content))}\n`);
             break;
         }
       }
