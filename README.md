@@ -1,3 +1,5 @@
+<img src="docs/header.jpg" alt="A graphics card joined by a single cable to six hand tools: a wrench, a magnifying glass, a pencil, a hammer, a file and a hook" width="100%">
+
 # brodecode
 
 A coding harness built by hand for one model, with no borrowed
