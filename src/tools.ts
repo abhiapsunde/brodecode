@@ -324,12 +324,28 @@ export class ToolExecutor {
 
   private async grep(pattern: string, subPath: string): Promise<string> {
     const regex = new RegExp(pattern);
-    const startDir = this.resolvePath(subPath);
-    const entries = await fs.readdir(startDir, { recursive: true, withFileTypes: true });
+    const start = this.resolvePath(subPath);
+
+    // grep(pattern, "server.js") is a reasonable thing for a model to
+    // ask for, and readdir on a file throws ENOTDIR, which told the
+    // model nothing about what it had done wrong. Observed burning
+    // two rounds and ~56s of reasoning on the same dead end in one
+    // session, re-issuing the identical failing call. A path that
+    // names a file searches that file.
+    let files: string[];
+    const stat = await fs.stat(start).catch(() => null);
+    if (!stat) return `error: no such file or directory: ${subPath}`;
+    if (stat.isFile()) {
+      files = [start];
+    } else {
+      const entries = await fs.readdir(start, { recursive: true, withFileTypes: true });
+      files = entries
+        .filter((e) => e.isFile())
+        .map((e) => path.join(e.parentPath ?? start, e.name));
+    }
+
     const hits: string[] = [];
-    for (const e of entries) {
-      if (!e.isFile()) continue;
-      const full = path.join(e.parentPath ?? startDir, e.name);
+    for (const full of files) {
       if (isIgnoredPath(path.relative(this.workingDir, full))) continue;
       let content: string;
       try {
