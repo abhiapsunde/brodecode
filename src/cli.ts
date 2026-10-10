@@ -136,55 +136,110 @@ async function main() {
     const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let spinnerIdx = 0;
     let streaming = false;
-    // Two rounds of just tuning the interval (200ms, then 600ms)
-    // still read as uncomfortable to look at - the actual problem
-    // wasn't speed, it was a *sliding* window: every redraw showed a
-    // different arbitrary substring, so the start of the line jumped
-    // around unpredictably each time, which is what reads as motion/
-    // flicker rather than text. Fix: stop sliding. Text only ever
-    // grows left-to-right (pure append, nothing at the start ever
-    // changes) until it hits a width cap, then does one clean reset -
-    // like a page turning, not a window shuffling. Growth-only redraws
-    // are calm enough to redraw fairly often; the only "jump" is the
-    // occasional full reset, which is rare and reads as a clean
-    // transition instead of constant jitter.
-    let currentPage = '';
+
+    // Third attempt at this. Attempt one printed the reasoning
+    // permanently, which buried every session in a transcript nobody
+    // reads. Attempt two showed a live tail of the generated text in
+    // one line that grew to 100 chars and then reset, which is a
+    // marquee: text slides past too fast to read, and resetting makes
+    // it worse, so the one thing on screen is the one thing you
+    // cannot use.
+    //
+    // The mistake both times was treating the model's output as the
+    // progress indicator. What you actually want to know while
+    // waiting is whether it is stuck, and that question is answered
+    // by a phase and two counters, not by prose. So: a fixed-width
+    // status line where nothing moves except numbers. The reasoning
+    // itself is durable in the session log, one summary line in
+    // scrollback, and in full on the terminal only if asked for with
+    // BRODECODE_SHOW_THINKING=1.
+    const showThinking = process.env.BRODECODE_SHOW_THINKING === '1';
+    type Phase = 'waiting' | 'thinking' | 'writing' | 'tool call';
+    let phase: Phase = 'waiting';
+    let tokens = 0;
+    let thinkTokens = 0;
+    let thinkStartedAt = 0;
+    let thinkMs = 0;
+    const turnStartedAt = Date.now();
+    // Tags can land split across two chunks ("<thi" + "nk>"), so each
+    // chunk is searched together with the tail of the previous one.
+    let tagTail = '';
+    const LONGEST_TAG = '</tool_call>'.length;
     let lastRenderAt = 0;
-    const RENDER_INTERVAL_MS = 300;
-    const PAGE_WIDTH_CHARS = 100;
+    const RENDER_INTERVAL_MS = 250;
+
+    const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+    const renderStatus = () => {
+      spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
+      const label = phase.padEnd(10);
+      const line = `${spinnerFrames[spinnerIdx]} ${label} ${tokens} tokens · ${secs(Date.now() - turnStartedAt)}`;
+      process.stdout.write(`\r\x1b[2K${dim(line)}`);
+    };
+
+    const enterPhase = (next: Phase) => {
+      if (next === phase) return;
+      if (phase === 'thinking') thinkMs += Date.now() - thinkStartedAt;
+      if (next === 'thinking') thinkStartedAt = Date.now();
+      phase = next;
+    };
+
     const onToken = (chunk: string) => {
       streaming = true;
-      currentPage += chunk.replace(/\s+/g, ' ');
-      if (currentPage.length > PAGE_WIDTH_CHARS) {
-        currentPage = '';
+      tokens += 1;
+      if (phase === 'thinking') thinkTokens += 1;
+
+      const window = tagTail + chunk;
+      // Later tags win: a single chunk can carry more than one
+      // transition, and the last one is the state we are now in.
+      let next: Phase | null = null;
+      let at = -1;
+      for (const [tag, p] of [
+        ['<think>', 'thinking'],
+        ['</think>', 'writing'],
+        ['<tool_call>', 'tool call'],
+      ] as [string, Phase][]) {
+        const idx = window.lastIndexOf(tag);
+        if (idx > at) { at = idx; next = p; }
       }
+      if (next) enterPhase(next);
+      tagTail = window.slice(-LONGEST_TAG);
+
       const now = Date.now();
       if (now - lastRenderAt < RENDER_INTERVAL_MS) return;
       lastRenderAt = now;
-      spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
-      process.stdout.write(`\r\x1b[2K${dim(`${spinnerFrames[spinnerIdx]} ${currentPage}`)}`);
+      renderStatus();
     };
 
     try {
       for await (const event of runTurn(history, userMessage, tools, onToken)) {
         if (streaming) {
-          process.stdout.write('\r\x1b[2K'); // clear the spinner line entirely
+          process.stdout.write('\r\x1b[2K'); // clear the status line entirely
           streaming = false;
-          currentPage = '';
         }
         await logger.logEvent(event);
         switch (event.type) {
-          case 'thinking':
-            // Deliberately no permanent output here. Thinking was
-            // already visible live while it streamed (onToken's tail
-            // preview, above) - printing it again now would mean
-            // every turn leaves a reasoning transcript in scrollback
-            // forever, which is exactly the "too much stays on
-            // screen" complaint this is fixing. Reasoning is
-            // transient by nature; tool calls, results, and the final
-            // answer are what's durable. The full text is still in
-            // the session log if it's ever needed later.
+          case 'thinking': {
+            // One durable line, not the transcript. It answers "did
+            // it think, and for how long", which is the part worth
+            // keeping in scrollback; the reasoning itself is in the
+            // session log. BRODECODE_SHOW_THINKING=1 prints the whole
+            // thing, wrapped to the terminal rather than dumped as
+            // one unbroken line.
+            enterPhase('writing'); // closes out the thinking clock if it is still open
+            console.log(dim(`  thought for ${secs(thinkMs)} (${thinkTokens} tokens)`));
+            if (showThinking && event.content.trim()) {
+              const width = Math.max(40, (process.stdout.columns ?? 80) - 4);
+              const wrapped = event.content.trim().split(/\s+/).reduce<string[]>((lines, word) => {
+                const last = lines[lines.length - 1];
+                if (last && (last + ' ' + word).length <= width) lines[lines.length - 1] = last + ' ' + word;
+                else lines.push(word);
+                return lines;
+              }, []);
+              for (const line of wrapped) console.log(dim(`  ${line}`));
+            }
             break;
+          }
           case 'tool_call': {
             // write()/edit() calls carry full file content as a JSON
             // argument - unlike tool_result, this had no cap at all,
