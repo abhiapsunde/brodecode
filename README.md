@@ -99,10 +99,20 @@ against its own repo. `/exit` or Ctrl-D to quit.
 | Variable | Default | What it does |
 |---|---|---|
 | `BRODECODE_SERVER_URL` | `http://127.0.0.1:8090` | Where llama-server is |
+| `BRODECODE_CONFIG` | `~/.brodecode/config.json` | Optional config file path |
 | `BRODECODE_CTX_SIZE` | `8192` | Must match the server's `--ctx-size` |
 | `BRODECODE_MAX_TURNS` | `20` | Tool-call rounds before giving up |
 | `BRODECODE_LOG_DIR` | `~/.brodecode/logs` | Where session JSONL goes |
 | `BRODECODE_SESSION_LABEL` | unset | Tags a session log for later review |
+
+If the runner lives on another machine, set it once in
+`~/.brodecode/config.json` instead of exporting a variable into every
+shell. Environment variables win over the file, the file wins over the
+built-in default.
+
+```json
+{ "serverUrl": "http://10.0.0.5:8090", "ctxSize": 8192, "maxTurns": 20 }
+```
 
 Every session writes unabridged JSONL alongside the terminal output:
 `session_start`, `user`, `thinking`, `tool_call` (full, never
