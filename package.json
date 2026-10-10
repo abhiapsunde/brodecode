@@ -1,18 +1,44 @@
 {
   "name": "brodecode",
   "version": "0.1.0",
-  "description": "A minimal coding harness built by hand for one model (Qwen3-14B via llama-server), no borrowed abstraction layer between the two.",
+  "description": "A minimal coding harness built by hand for one local model (Qwen3-14B via llama-server), with no borrowed abstraction layer in between.",
   "type": "module",
   "bin": {
     "brodecode": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "tsc && node dist/cli.js"
   },
-  "license": "UNLICENSED",
-  "private": true,
+  "keywords": [
+    "llm",
+    "agent",
+    "coding-agent",
+    "llama.cpp",
+    "llama-server",
+    "qwen3",
+    "local-llm",
+    "tool-calling"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abhiapsunde/brodecode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/abhiapsunde/brodecode/issues"
+  },
+  "homepage": "https://github.com/abhiapsunde/brodecode#readme",
+  "author": "Abhijeet Apsunde",
+  "license": "MIT",
   "devDependencies": {
     "typescript": "^5.7.2",
     "@types/node": "^22.10.2"

@@ -11,7 +11,7 @@ full state - nothing else to reconstruct.
 
 Five small scratch projects, each representing a different kind of
 task a real developer would throw at a coding assistant, live at
-`/Users/abhi/Documents/Github/tmp/personas/`:
+a scratch `personas/` directory outside this repo:
 
 1. `1-explorer-arr-utils` - pure Q&A, no edits expected (array utils,
    no README on purpose - tests real comprehension, not README-parroting)

@@ -21,8 +21,14 @@ abstraction), and hand-write a minimal harness - six tools, a short
 system prompt, our own parser for the model's real `<tool_call>` /
 `<think>` output - so there is nothing left in the middle to blame.
 
-Full writeup of the investigation that led here: see the `homelab`
-repo, `notes/2026-07-12-local-llm-agentic-coding-investigation.md`.
+What that investigation actually measured, before any of this was
+written: Claude Code's real outbound request was **101KB with 25 tool
+definitions**, one of which (`Workflow`) had a description 18,997
+characters long on its own. Scoping it down to
+`--tools Read,Write,Edit,Bash,Glob,Grep` took multi-step reliability
+from roughly 0% to 3 out of 4. The model was capable the whole time.
+It was being handed a toolset built for a much larger job than the one
+being asked of it.
 
 ## Architecture
 
@@ -51,16 +57,33 @@ believe the model, it's asked to check.
 
 ## Model runner
 
-`llama-server` (llama.cpp, Vulkan backend) running directly on
-`lallan-u24` via systemd, not as a k8s pod - see the `homelab` repo's
-`lallan-u24/README.md` for why, and the exact reinstall steps.
+You supply your own. The harness speaks to one endpoint,
+`POST /completion` on a `llama-server` (llama.cpp), and nothing else.
 
 ```
 Model:   Qwen3-14B, Q4_K_M GGUF (~9GB)
-Context: 8192 tokens (32768 didn't fit alongside the model weights in
-         12GB VRAM - see homelab repo for the OOM detail)
+Context: 8192 tokens
 Port:    8090
 ```
+
+```bash
+llama-server \
+  --model /path/to/Qwen3-14B-Q4_K_M.gguf \
+  --n-gpu-layers 999 \
+  --ctx-size 8192 \
+  --port 8090 \
+  --host 0.0.0.0
+```
+
+Sized for a 12GB card: the weights and an 8192-token KV cache land at
+about 9.8GB of VRAM, and `--ctx-size 32768` does not fit. Loading takes
+roughly 20 seconds. Both numbers are from an RTX 3080 Ti with the
+Vulkan backend.
+
+Another model will need `prompt.ts` adjusted. The prompt renderer emits
+ChatML by hand and `parse.ts` expects Qwen3's actual `<think>` and
+`<tool_call>` output, neither of which is negotiated with the server.
+That is the tradeoff this project is making on purpose.
 
 ## Running it
 
@@ -70,8 +93,37 @@ npm run build
 node dist/cli.js /path/to/some/project
 ```
 
-Set `BRODECODE_SERVER_URL` if the model runner isn't at the default
-`http://10.9.9.185:8090`.
+With no argument it uses the current directory, and it refuses to run
+against its own repo. `/exit` or Ctrl-D to quit.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BRODECODE_SERVER_URL` | `http://127.0.0.1:8090` | Where llama-server is |
+| `BRODECODE_CTX_SIZE` | `8192` | Must match the server's `--ctx-size` |
+| `BRODECODE_MAX_TURNS` | `20` | Tool-call rounds before giving up |
+| `BRODECODE_LOG_DIR` | `~/.brodecode/logs` | Where session JSONL goes |
+| `BRODECODE_SESSION_LABEL` | unset | Tags a session log for later review |
+
+Every session writes unabridged JSONL alongside the terminal output:
+`session_start`, `user`, `thinking`, `tool_call` (full, never
+truncated), `tool_result`, `final`, `error`. Reviewing a session with
+`jq` over that file is considerably easier than re-reading ANSI
+terminal scrollback, which is why it exists.
+
+## Scope
+
+This is one person's harness for one model, published because the
+failure modes it documents are more useful than the code. It is not
+trying to be a general coding agent, and several things it lacks are
+deliberate rather than pending: no multi-model support, no MCP, no
+plugin system, no permission prompts, no sandbox. `bash()` runs what
+the model asks for, scoped to the working directory and nothing
+stronger, so point it at a project you can afford to have edited and
+keep it off anything you cannot restore from git.
+
+Six tools, a short system prompt, and a parser that handles exactly
+one model's output format. Adding a seventh tool is a decision with a
+measured cost, which is the whole premise.
 
 ## Status
 
