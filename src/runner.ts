@@ -1,5 +1,28 @@
 import { config, configPath } from './config.js';
 
+/** What the runner is actually serving. Asked once at startup so the
+ *  terminal can name the model rather than leaving the user to assume
+ *  it matches whatever they last configured - the model itself cannot
+ *  be trusted to answer "which model are you", since nothing in the
+ *  prompt tells it and it will cheerfully guess from training data. */
+export async function serverInfo(): Promise<{ model: string; ctx: number } | null> {
+  try {
+    const res = await fetch(`${config.llamaServerUrl}/props`);
+    if (!res.ok) return null;
+    const props = await res.json() as {
+      model_path?: string;
+      default_generation_settings?: { n_ctx?: number };
+    };
+    const file = (props.model_path ?? '').split('/').pop() ?? '';
+    return {
+      model: file.replace(/\.gguf$/i, '') || 'unknown',
+      ctx: props.default_generation_settings?.n_ctx ?? config.contextSize,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Raw completion call against llama-server - not the OpenAI/Anthropic
  *  compatible chat routes. We control the exact prompt text end to end;
  *  nothing in between us and the model reformats or reinterprets it.

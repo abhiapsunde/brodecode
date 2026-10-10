@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Message, ToolCall } from './types.js';
 import { runTurn } from './agent.js';
+import { serverInfo } from './runner.js';
 import { ToolExecutor } from './tools.js';
 import { config } from './config.js';
 import { SessionLogger } from './logger.js';
@@ -99,9 +100,15 @@ async function main() {
   const logger = new SessionLogger(workingDir, process.env.BRODECODE_SESSION_LABEL);
   await logger.init(workingDir, process.env.BRODECODE_SESSION_LABEL);
 
+  const info = await serverInfo();
   console.log(`brodecode - working dir: ${workingDir}`);
-  console.log(dim(`model runner: ${config.llamaServerUrl}`));
+  console.log(dim(info
+    ? `model: ${info.model} · ${info.ctx} ctx · ${config.llamaServerUrl}`
+    : `model runner: ${config.llamaServerUrl} (not responding to /props)`));
   console.log(dim(`session log: ${logger.filePath}\n`));
+  // Short enough to sit in a status line redrawn several times a
+  // second without the line wrapping on a narrow terminal.
+  const modelLabel = (info?.model ?? 'model').split(/[-_.]/).slice(0, 2).join('-').toLowerCase();
 
   const rl = readline.createInterface({ input: stdin, output: stdout });
 
@@ -165,6 +172,14 @@ async function main() {
     // chunk is searched together with the tail of the previous one.
     let tagTail = '';
     const LONGEST_TAG = '</tool_call>'.length;
+    let round = 1;
+    // The tool's name arrives in the stream well before the arguments
+    // finish, so it can be shown while the model is still writing the
+    // call out. Sniffed from a bounded tail of the raw text rather
+    // than kept whole: a write() call carries an entire file.
+    let pendingTool = '';
+    let rawTail = '';
+    const RAW_TAIL_CHARS = 400;
     let lastRenderAt = 0;
     const RENDER_INTERVAL_MS = 250;
 
@@ -172,8 +187,18 @@ async function main() {
 
     const renderStatus = () => {
       spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
-      const label = phase.padEnd(10);
-      const line = `${spinnerFrames[spinnerIdx]} ${label} ${tokens} tokens · ${secs(Date.now() - turnStartedAt)}`;
+      // Phase alone answered "is it stuck" and nothing else. Which
+      // model is answering, which tool it is reaching for, and how
+      // far into the 20-round limit it is are the three things that
+      // turn "something is happening" into "I know what is
+      // happening", and all three fit on one line.
+      const what = phase === 'tool call' && pendingTool ? `tool call ${pendingTool}` : phase;
+      const line = [
+        `${spinnerFrames[spinnerIdx]} ${modelLabel}`,
+        `round ${round}/${config.maxTurns}`,
+        what,
+        `${tokens} tok · ${secs(Date.now() - turnStartedAt)}`,
+      ].join(' · ');
       process.stdout.write(`\r\x1b[2K${dim(line)}`);
     };
 
@@ -184,10 +209,15 @@ async function main() {
       phase = next;
     };
 
-    const onToken = (chunk: string) => {
+    const onToken = (chunk: string, chunkRound: number) => {
       streaming = true;
       tokens += 1;
       if (phase === 'thinking') thinkTokens += 1;
+      if (chunkRound !== round) { round = chunkRound; pendingTool = ''; }
+
+      rawTail = (rawTail + chunk).slice(-RAW_TAIL_CHARS);
+      const named = rawTail.match(/"name"\s*:\s*"([a-z_]+)"/i);
+      if (named) pendingTool = named[1];
 
       const window = tagTail + chunk;
       // Later tags win: a single chunk can carry more than one
@@ -247,6 +277,7 @@ async function main() {
             // wall of escaped JSON onto one terminal line. The full
             // call still goes to the session log unabridged.
             const preview = event.toolCall ? formatToolCall(event.toolCall) : event.content;
+            pendingTool = '';
             console.log(yellow(`→ ${preview}`));
             break;
           }

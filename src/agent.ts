@@ -105,21 +105,26 @@ export function trimToBudget(history: Message[], tools: ToolDefinition[], workin
  *  the caller's conversation state stays current across turns.
  *
  *  `onToken` fires for every raw chunk the model streams back, before
- *  any parsing - this is what lets the CLI show it's actually doing
- *  something instead of sitting in silence for however many seconds a
- *  turn takes. */
+ *  any parsing, with the 1-based tool-call round it belongs to - this
+ *  is what lets the CLI show it's actually doing something, and how
+ *  far into the turn limit it is, instead of sitting in silence for
+ *  however many seconds a turn takes. */
 export async function* runTurn(
   history: Message[],
   userMessage: string,
   tools: ToolExecutor,
-  onToken?: (chunk: string) => void,
+  onToken?: (chunk: string, round: number) => void,
 ): AsyncGenerator<TurnEvent> {
   history.push({ role: 'user', content: userMessage });
 
   for (let turn = 0; turn < config.maxTurns; turn++) {
     trimToBudget(history, toolDefinitions, tools.workingDir);
     const prompt = renderPrompt(history, toolDefinitions, tools.workingDir);
-    const raw = await complete(prompt, onToken);
+    // The round number is the single most useful thing the status
+    // line can add: "thinking" on round 2 and "thinking" on round 17
+    // of a 20-round limit mean very different things about whether
+    // this is going to finish.
+    const raw = await complete(prompt, onToken && ((chunk) => onToken(chunk, turn + 1)));
     const parsed = parseResponse(raw);
 
     if (parsed.thinking) {
