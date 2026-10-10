@@ -1,9 +1,17 @@
-<img src="docs/header.jpg" alt="A graphics card joined by a single cable to six hand tools: a wrench, a magnifying glass, a pencil, a hammer, a file and a hook" width="100%">
+<p align="center">
+  <img src="docs/logo.jpg" alt="" width="110">
+</p>
 
-# brodecode
+<h1 align="center">brodecode</h1>
 
-A coding harness built by hand for one model, with no borrowed
-abstraction layer sitting between the two.
+<p align="center">
+  A coding harness built by hand for one model,<br>
+  with no borrowed abstraction layer sitting between the two.
+</p>
+
+<p align="center">
+  <img src="docs/header.jpg" alt="A graphics card joined by a single cable to six hand tools: a wrench, a magnifying glass, a pencil, a hammer, a file and a hook" width="100%">
+</p>
 
 ## Why this exists
 
