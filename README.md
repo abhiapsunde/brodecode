@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/logo.jpg" alt="" width="110">
-</p>
-
 <h1 align="center">brodecode</h1>
 
 <p align="center">
