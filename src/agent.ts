@@ -150,6 +150,7 @@ export async function* runTurn(
   userMessage: string,
   tools: ToolExecutor,
   onToken?: (chunk: string, round: number) => void,
+  signal?: AbortSignal,
 ): AsyncGenerator<TurnEvent> {
   history.push({ role: 'user', content: userMessage });
 
@@ -160,7 +161,7 @@ export async function* runTurn(
     // line can add: "thinking" on round 2 and "thinking" on round 17
     // of a 20-round limit mean very different things about whether
     // this is going to finish.
-    const raw = await complete(prompt, onToken && ((chunk) => onToken(chunk, turn + 1)));
+    const raw = await complete(prompt, onToken && ((chunk) => onToken(chunk, turn + 1)), signal);
     const parsed = parseResponse(raw);
 
     if (parsed.thinking) {
@@ -193,6 +194,10 @@ export async function* runTurn(
     });
 
     for (const call of parsed.toolCalls) {
+      // Checked between tool calls as well as between rounds: a turn
+      // that is three shell commands deep should stop when asked,
+      // not after the third one finishes.
+      if (signal?.aborted) return;
       yield { type: 'tool_call', content: `${call.name}(${JSON.stringify(call.arguments)})`, toolCall: call };
       const result = await tools.execute(call);
       yield { type: 'tool_result', content: result };

@@ -30,7 +30,7 @@ export async function serverInfo(): Promise<{ model: string; ctx: number } | nul
  *  Streams tokens via onToken as they arrive (so the CLI can show real,
  *  live progress instead of silence followed by a wall of text), and
  *  returns the full accumulated response once generation stops. */
-export async function complete(prompt: string, onToken?: (chunk: string) => void): Promise<string> {
+export async function complete(prompt: string, onToken?: (chunk: string) => void, signal?: AbortSignal): Promise<string> {
   let res: Response;
   try {
     res = await fetch(`${config.llamaServerUrl}/completion`, {
@@ -42,8 +42,10 @@ export async function complete(prompt: string, onToken?: (chunk: string) => void
         stop: ['<|im_end|>', '<|im_start|>'],
         stream: true,
       }),
+      signal,
     });
   } catch (err) {
+    if ((err as Error)?.name === 'AbortError') throw err;
     // Node's bare "fetch failed" names neither the host nor the
     // reason, which is the single least useful thing to read after
     // typing a prompt and waiting. Connection refused against a

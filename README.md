@@ -110,6 +110,14 @@ against its own repo. `/exit` or Ctrl-D to quit.
 | `BRODECODE_MAX_TURNS` | `20` | Tool-call rounds before giving up |
 | `BRODECODE_LOG_DIR` | `~/.brodecode/logs` | Where session JSONL goes |
 | `BRODECODE_SESSION_LABEL` | unset | Tags a session log for later review |
+| `BRODECODE_SHOW_THINKING` | unset | `1` prints the model's reasoning in full |
+
+Inside a session: `/help`, `/files` (what has been written or edited),
+`/exit`. Ctrl-C stops the turn in progress and keeps the conversation;
+a second within three seconds exits. For scripting, `brodecode -p
+"fix the failing test" [dir]` runs one turn and exits, which is the
+honest interface for it: the REPL reads one line at a time, so a
+pasted multi-line stack trace becomes one turn per line.
 
 If the runner lives on another machine, set it once in
 `~/.brodecode/config.json` instead of exporting a variable into every

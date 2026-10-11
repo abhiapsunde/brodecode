@@ -29,6 +29,16 @@ function renderMarkdown(text: string): string {
     .replace(/`([^`]+)`/g, '\x1b[36m$1\x1b[32m');
 }
 
+const HELP = `  /help            this
+  /files           files written or edited this session
+  /exit, /quit     leave (Ctrl-D also works)
+  Ctrl-C           stop the turn in progress, keep the session
+
+  one-shot:        brodecode -p "fix the failing test" [dir]
+  environment:     BRODECODE_SERVER_URL, BRODECODE_CTX_SIZE, BRODECODE_MAX_TURNS,
+                   BRODECODE_LOG_DIR, BRODECODE_SESSION_LABEL, BRODECODE_SHOW_THINKING
+  config file:     ~/.brodecode/config.json  { "serverUrl": "http://host:8090" }`;
+
 const TOOL_CALL_PREVIEW_CHARS = 200;
 const BASH_COMMAND_PREVIEW_CHARS = 150;
 
@@ -43,8 +53,16 @@ function formatToolCall(call: ToolCall): string {
   switch (call.name) {
     case 'write':
       return `write(${args.file_path}, ${String(args.content ?? '').length} bytes)`;
-    case 'edit':
-      return `edit(${args.file_path}, ${String(args.old_string ?? '').length} chars -> ${String(args.new_string ?? '').length} chars)`;
+    case 'edit': {
+      // "23 chars -> 743 chars" tells you an edit happened and
+      // nothing about what it did. The first changed line is what a
+      // person actually wants to see go past.
+      const firstLine = (t: string) => {
+        const line = String(t ?? '').split('\n').find((l) => l.trim()) ?? '';
+        return line.trim().length > 48 ? line.trim().slice(0, 48) + '…' : line.trim();
+      };
+      return `edit(${args.file_path})\n    - ${firstLine(args.old_string as string)}\n    + ${firstLine(args.new_string as string)}`;
+    }
     case 'bash': {
       const command = String(args.command ?? '');
       const preview = command.length > BASH_COMMAND_PREVIEW_CHARS
@@ -74,6 +92,15 @@ function formatToolCall(call: ToolCall): string {
  *  overwrite this project's own package.json. */
 const selfDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+/** `brodecode -p "do the thing" [dir]` runs one turn and exits.
+ *
+ *  Piping into the REPL works, but one line of input is one turn, so
+ *  a pasted multi-line error becomes one turn per line, and scripting
+ *  it meant driving a pty. A flag is the honest interface for
+ *  "one prompt, print the answer, exit". */
+const printIdx = process.argv.findIndex((a) => a === '-p' || a === '--print');
+const oneShotPrompt = printIdx !== -1 ? process.argv[printIdx + 1] : undefined;
+
 async function resolveWorkingDir(): Promise<string> {
   // Standard CLI convention (matches git, npm, etc.): operate on wherever
   // you launched from, unless told otherwise with an explicit argument.
@@ -81,7 +108,8 @@ async function resolveWorkingDir(): Promise<string> {
   // against brodecode's own repo, whether that came from the default or
   // an explicit path - that's the specific accident this is preventing,
   // not "no default at all".
-  const arg = process.argv[2];
+  const args = process.argv.slice(2).filter((a) => a !== '-p' && a !== '--print');
+  const arg = args.find((a) => !a.startsWith('-') && a !== oneShotPrompt);
   const resolved = path.resolve(arg ?? process.cwd());
   if (resolved === selfDir || resolved.startsWith(selfDir + path.sep)) {
     console.error(red(`refusing to run against ${resolved} - that's inside brodecode's own repo, not a project directory.`));
@@ -110,6 +138,227 @@ async function main() {
   // second without the line wrapping on a narrow terminal.
   const modelLabel = (info?.model ?? 'model').split(/[-_.]/).slice(0, 2).join('-').toLowerCase();
 
+  /** One user message, start to finish. Extracted so one-shot mode
+   *  and the REPL run exactly the same path rather than two that
+   *  drift apart. */
+  async function runOneTurn(userMessage: string): Promise<void>  {
+  await logger.logUser(userMessage);
+
+  // Ctrl-C used to kill the process, taking the conversation with it,
+  // which is a harsh penalty for "this is going the wrong way". It
+  // now aborts the in-flight request and returns to the prompt with
+  // the history intact. A second one within three seconds still
+  // exits, because that is what a wedged program needs.
+  const turnAbort = new AbortController();
+  let lastInterrupt = 0;
+  const onInterrupt = () => {
+    const now = Date.now();
+    if (now - lastInterrupt < 3000) {
+      process.stdout.write('\n');
+      process.exit(130);
+    }
+    lastInterrupt = now;
+    turnAbort.abort();
+  };
+  process.on('SIGINT', onInterrupt);
+
+  // Live progress while the model is actually generating - the fix
+  // for "is it working, stuck, or failed, no idea". A single
+  // overwriting status line driven by real streamed tokens (so it's
+  // never lying about progress), showing a live tail of what's
+  // actually being generated rather than just a token count - this
+  // is also where thinking becomes visible: live, while it's
+  // happening, then gone once it resolves (see the 'thinking' case
+  // below, which deliberately prints nothing permanent).
+  const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let spinnerIdx = 0;
+  let streaming = false;
+
+  // Third attempt at this. Attempt one printed the reasoning
+  // permanently, which buried every session in a transcript nobody
+  // reads. Attempt two showed a live tail of the generated text in
+  // one line that grew to 100 chars and then reset, which is a
+  // marquee: text slides past too fast to read, and resetting makes
+  // it worse, so the one thing on screen is the one thing you
+  // cannot use.
+  //
+  // The mistake both times was treating the model's output as the
+  // progress indicator. What you actually want to know while
+  // waiting is whether it is stuck, and that question is answered
+  // by a phase and two counters, not by prose. So: a fixed-width
+  // status line where nothing moves except numbers. The reasoning
+  // itself is durable in the session log, one summary line in
+  // scrollback, and in full on the terminal only if asked for with
+  // BRODECODE_SHOW_THINKING=1.
+  const showThinking = process.env.BRODECODE_SHOW_THINKING === '1';
+  type Phase = 'waiting' | 'thinking' | 'writing' | 'tool call';
+  let phase: Phase = 'waiting';
+  let tokens = 0;
+  let thinkTokens = 0;
+  let thinkStartedAt = 0;
+  let thinkMs = 0;
+  const turnStartedAt = Date.now();
+  // Tags can land split across two chunks ("<thi" + "nk>"), so each
+  // chunk is searched together with the tail of the previous one.
+  let tagTail = '';
+  const LONGEST_TAG = '</tool_call>'.length;
+  let round = 1;
+  // The tool's name arrives in the stream well before the arguments
+  // finish, so it can be shown while the model is still writing the
+  // call out. Sniffed from a bounded tail of the raw text rather
+  // than kept whole: a write() call carries an entire file.
+  let pendingTool = '';
+  let rawTail = '';
+  const RAW_TAIL_CHARS = 400;
+  let lastRenderAt = 0;
+  const RENDER_INTERVAL_MS = 250;
+
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+  const renderStatus = () => {
+    spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
+    // Phase alone answered "is it stuck" and nothing else. Which
+    // model is answering, which tool it is reaching for, and how
+    // far into the 20-round limit it is are the three things that
+    // turn "something is happening" into "I know what is
+    // happening", and all three fit on one line.
+    const what = phase === 'tool call' && pendingTool ? `tool call ${pendingTool}` : phase;
+    const line = [
+      `${spinnerFrames[spinnerIdx]} ${modelLabel}`,
+      `round ${round}/${config.maxTurns}`,
+      what,
+      `${tokens} tok · ${secs(Date.now() - turnStartedAt)}`,
+    ].join(' · ');
+    process.stdout.write(`\r\x1b[2K${dim(line)}`);
+  };
+
+  const enterPhase = (next: Phase) => {
+    if (next === phase) return;
+    if (phase === 'thinking') thinkMs += Date.now() - thinkStartedAt;
+    if (next === 'thinking') thinkStartedAt = Date.now();
+    phase = next;
+  };
+
+  const onToken = (chunk: string, chunkRound: number) => {
+    streaming = true;
+    tokens += 1;
+    if (phase === 'thinking') thinkTokens += 1;
+    if (chunkRound !== round) { round = chunkRound; pendingTool = ''; }
+
+    rawTail = (rawTail + chunk).slice(-RAW_TAIL_CHARS);
+    const named = rawTail.match(/"name"\s*:\s*"([a-z_]+)"/i);
+    if (named) pendingTool = named[1];
+
+    const window = tagTail + chunk;
+    // Later tags win: a single chunk can carry more than one
+    // transition, and the last one is the state we are now in.
+    let next: Phase | null = null;
+    let at = -1;
+    for (const [tag, p] of [
+      ['<think>', 'thinking'],
+      ['</think>', 'writing'],
+      ['<tool_call>', 'tool call'],
+    ] as [string, Phase][]) {
+      const idx = window.lastIndexOf(tag);
+      if (idx > at) { at = idx; next = p; }
+    }
+    if (next) enterPhase(next);
+    tagTail = window.slice(-LONGEST_TAG);
+
+    const now = Date.now();
+    if (now - lastRenderAt < RENDER_INTERVAL_MS) return;
+    lastRenderAt = now;
+    renderStatus();
+  };
+
+  // Rendering only started when the first token arrived, so a slow
+  // prompt meant seconds of blank terminal with no sign that anything
+  // was happening. Draw the line up front and let the counters catch
+  // up to it.
+  streaming = true;
+  renderStatus();
+  const tick = setInterval(renderStatus, RENDER_INTERVAL_MS);
+
+  try {
+    for await (const event of runTurn(history, userMessage, tools, onToken, turnAbort.signal)) {
+      if (streaming) {
+        process.stdout.write('\r\x1b[2K'); // clear the status line entirely
+        streaming = false;
+      }
+      await logger.logEvent(event);
+      switch (event.type) {
+        case 'thinking': {
+          // One durable line, not the transcript. It answers "did
+          // it think, and for how long", which is the part worth
+          // keeping in scrollback; the reasoning itself is in the
+          // session log. BRODECODE_SHOW_THINKING=1 prints the whole
+          // thing, wrapped to the terminal rather than dumped as
+          // one unbroken line.
+          enterPhase('writing'); // closes out the thinking clock if it is still open
+          console.log(dim(`  thought for ${secs(thinkMs)} (${thinkTokens} tokens)`));
+          if (showThinking && event.content.trim()) {
+            const width = Math.max(40, (process.stdout.columns ?? 80) - 4);
+            const wrapped = event.content.trim().split(/\s+/).reduce<string[]>((lines, word) => {
+              const last = lines[lines.length - 1];
+              if (last && (last + ' ' + word).length <= width) lines[lines.length - 1] = last + ' ' + word;
+              else lines.push(word);
+              return lines;
+            }, []);
+            for (const line of wrapped) console.log(dim(`  ${line}`));
+          }
+          break;
+        }
+        case 'tool_call': {
+          // write()/edit() calls carry full file content as a JSON
+          // argument - unlike tool_result, this had no cap at all,
+          // so a single write() could dump a thousand-plus-char
+          // wall of escaped JSON onto one terminal line. The full
+          // call still goes to the session log unabridged.
+          const preview = event.toolCall ? formatToolCall(event.toolCall) : event.content;
+          pendingTool = '';
+          console.log(yellow(`→ ${preview}`));
+          break;
+        }
+        case 'tool_result': {
+          // Showing only the first five lines hid the end of every
+          // command, which is where a stack trace and a test
+          // summary live. Keep both ends and say where the rest is.
+          const lines = event.content.split('\n');
+          if (lines.length <= 8) {
+            console.log(dim(event.content));
+          } else {
+            const head = lines.slice(0, 5).join('\n');
+            const tail = lines.slice(-3).join('\n');
+            console.log(dim(`${head}\n  ... ${lines.length - 8} more lines, full text in the session log ...\n${tail}`));
+          }
+          break;
+        }
+        case 'final':
+          console.log(`\n${green(renderMarkdown(event.content))}\n`);
+          break;
+      }
+    }
+  } catch (err) {
+    if (streaming) process.stdout.write('\r\x1b[2K');
+    if ((err as Error)?.name === 'AbortError' || turnAbort.signal.aborted) {
+      console.log(dim('stopped. the conversation so far is kept, type the next thing.'));
+    } else {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(red(`turn failed: ${message}`));
+      await logger.logError(message);
+    }
+  } finally {
+    clearInterval(tick);
+    process.off('SIGINT', onInterrupt);
+  }
+
+  }
+
+  if (oneShotPrompt) {
+    await runOneTurn(oneShotPrompt);
+    return;
+  }
+
   const rl = readline.createInterface({ input: stdin, output: stdout });
 
   // Deliberately not rl.question() in a loop: readline's 'close' event
@@ -128,177 +377,30 @@ async function main() {
       process.stdout.write('> ');
       continue;
     }
-    if (userMessage.trim() === '/exit') break;
-
-    await logger.logUser(userMessage);
-
-    // Live progress while the model is actually generating - the fix
-    // for "is it working, stuck, or failed, no idea". A single
-    // overwriting status line driven by real streamed tokens (so it's
-    // never lying about progress), showing a live tail of what's
-    // actually being generated rather than just a token count - this
-    // is also where thinking becomes visible: live, while it's
-    // happening, then gone once it resolves (see the 'thinking' case
-    // below, which deliberately prints nothing permanent).
-    const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let spinnerIdx = 0;
-    let streaming = false;
-
-    // Third attempt at this. Attempt one printed the reasoning
-    // permanently, which buried every session in a transcript nobody
-    // reads. Attempt two showed a live tail of the generated text in
-    // one line that grew to 100 chars and then reset, which is a
-    // marquee: text slides past too fast to read, and resetting makes
-    // it worse, so the one thing on screen is the one thing you
-    // cannot use.
-    //
-    // The mistake both times was treating the model's output as the
-    // progress indicator. What you actually want to know while
-    // waiting is whether it is stuck, and that question is answered
-    // by a phase and two counters, not by prose. So: a fixed-width
-    // status line where nothing moves except numbers. The reasoning
-    // itself is durable in the session log, one summary line in
-    // scrollback, and in full on the terminal only if asked for with
-    // BRODECODE_SHOW_THINKING=1.
-    const showThinking = process.env.BRODECODE_SHOW_THINKING === '1';
-    type Phase = 'waiting' | 'thinking' | 'writing' | 'tool call';
-    let phase: Phase = 'waiting';
-    let tokens = 0;
-    let thinkTokens = 0;
-    let thinkStartedAt = 0;
-    let thinkMs = 0;
-    const turnStartedAt = Date.now();
-    // Tags can land split across two chunks ("<thi" + "nk>"), so each
-    // chunk is searched together with the tail of the previous one.
-    let tagTail = '';
-    const LONGEST_TAG = '</tool_call>'.length;
-    let round = 1;
-    // The tool's name arrives in the stream well before the arguments
-    // finish, so it can be shown while the model is still writing the
-    // call out. Sniffed from a bounded tail of the raw text rather
-    // than kept whole: a write() call carries an entire file.
-    let pendingTool = '';
-    let rawTail = '';
-    const RAW_TAIL_CHARS = 400;
-    let lastRenderAt = 0;
-    const RENDER_INTERVAL_MS = 250;
-
-    const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
-
-    const renderStatus = () => {
-      spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
-      // Phase alone answered "is it stuck" and nothing else. Which
-      // model is answering, which tool it is reaching for, and how
-      // far into the 20-round limit it is are the three things that
-      // turn "something is happening" into "I know what is
-      // happening", and all three fit on one line.
-      const what = phase === 'tool call' && pendingTool ? `tool call ${pendingTool}` : phase;
-      const line = [
-        `${spinnerFrames[spinnerIdx]} ${modelLabel}`,
-        `round ${round}/${config.maxTurns}`,
-        what,
-        `${tokens} tok · ${secs(Date.now() - turnStartedAt)}`,
-      ].join(' · ');
-      process.stdout.write(`\r\x1b[2K${dim(line)}`);
-    };
-
-    const enterPhase = (next: Phase) => {
-      if (next === phase) return;
-      if (phase === 'thinking') thinkMs += Date.now() - thinkStartedAt;
-      if (next === 'thinking') thinkStartedAt = Date.now();
-      phase = next;
-    };
-
-    const onToken = (chunk: string, chunkRound: number) => {
-      streaming = true;
-      tokens += 1;
-      if (phase === 'thinking') thinkTokens += 1;
-      if (chunkRound !== round) { round = chunkRound; pendingTool = ''; }
-
-      rawTail = (rawTail + chunk).slice(-RAW_TAIL_CHARS);
-      const named = rawTail.match(/"name"\s*:\s*"([a-z_]+)"/i);
-      if (named) pendingTool = named[1];
-
-      const window = tagTail + chunk;
-      // Later tags win: a single chunk can carry more than one
-      // transition, and the last one is the state we are now in.
-      let next: Phase | null = null;
-      let at = -1;
-      for (const [tag, p] of [
-        ['<think>', 'thinking'],
-        ['</think>', 'writing'],
-        ['<tool_call>', 'tool call'],
-      ] as [string, Phase][]) {
-        const idx = window.lastIndexOf(tag);
-        if (idx > at) { at = idx; next = p; }
-      }
-      if (next) enterPhase(next);
-      tagTail = window.slice(-LONGEST_TAG);
-
-      const now = Date.now();
-      if (now - lastRenderAt < RENDER_INTERVAL_MS) return;
-      lastRenderAt = now;
-      renderStatus();
-    };
-
-    try {
-      for await (const event of runTurn(history, userMessage, tools, onToken)) {
-        if (streaming) {
-          process.stdout.write('\r\x1b[2K'); // clear the status line entirely
-          streaming = false;
-        }
-        await logger.logEvent(event);
-        switch (event.type) {
-          case 'thinking': {
-            // One durable line, not the transcript. It answers "did
-            // it think, and for how long", which is the part worth
-            // keeping in scrollback; the reasoning itself is in the
-            // session log. BRODECODE_SHOW_THINKING=1 prints the whole
-            // thing, wrapped to the terminal rather than dumped as
-            // one unbroken line.
-            enterPhase('writing'); // closes out the thinking clock if it is still open
-            console.log(dim(`  thought for ${secs(thinkMs)} (${thinkTokens} tokens)`));
-            if (showThinking && event.content.trim()) {
-              const width = Math.max(40, (process.stdout.columns ?? 80) - 4);
-              const wrapped = event.content.trim().split(/\s+/).reduce<string[]>((lines, word) => {
-                const last = lines[lines.length - 1];
-                if (last && (last + ' ' + word).length <= width) lines[lines.length - 1] = last + ' ' + word;
-                else lines.push(word);
-                return lines;
-              }, []);
-              for (const line of wrapped) console.log(dim(`  ${line}`));
-            }
-            break;
-          }
-          case 'tool_call': {
-            // write()/edit() calls carry full file content as a JSON
-            // argument - unlike tool_result, this had no cap at all,
-            // so a single write() could dump a thousand-plus-char
-            // wall of escaped JSON onto one terminal line. The full
-            // call still goes to the session log unabridged.
-            const preview = event.toolCall ? formatToolCall(event.toolCall) : event.content;
-            pendingTool = '';
-            console.log(yellow(`→ ${preview}`));
-            break;
-          }
-          case 'tool_result': {
-            const lines = event.content.split('\n');
-            const preview = lines.slice(0, 5).join('\n');
-            console.log(dim(preview + (lines.length > 5 ? `\n  ... (${lines.length - 5} more lines)` : '')));
-            break;
-          }
-          case 'final':
-            console.log(`\n${green(renderMarkdown(event.content))}\n`);
-            break;
-        }
-      }
-    } catch (err) {
-      if (streaming) process.stdout.write('\r\x1b[2K');
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(red(`turn failed: ${message}`));
-      await logger.logError(message);
+    const command = userMessage.trim();
+    if (command === '/exit' || command === '/quit') break;
+    if (command === '/help') {
+      console.log(HELP);
+      process.stdout.write('> ');
+      continue;
+    }
+    if (command === '/files') {
+      // "What has this thing actually touched?" was only answerable
+      // by scrolling back through the whole session.
+      const touched = tools.changedFiles();
+      console.log(touched.length
+        ? dim(`changed this session:\n  ${touched.join('\n  ')}`)
+        : dim('nothing written or edited this session'));
+      process.stdout.write('> ');
+      continue;
+    }
+    if (command.startsWith('/')) {
+      console.log(dim(`unknown command ${command}. /help lists them.`));
+      process.stdout.write('> ');
+      continue;
     }
 
+    await runOneTurn(userMessage);
     process.stdout.write('> ');
   }
 

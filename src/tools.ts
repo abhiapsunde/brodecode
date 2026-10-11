@@ -7,6 +7,25 @@ import type { ToolCall, ToolDefinition } from './types.js';
 
 const execAsync = promisify(exec);
 
+// Every one of these exists because an unbounded value reached the
+// prompt and cost a turn. The window is 8,192 tokens; at roughly three
+// characters per token a single 25,000 character tool result is an
+// eighth of it.
+const READ_CHAR_CAP = 24_000;
+const BASH_OUTPUT_CAP = 12_000;
+const GLOB_RESULT_CAP = 200;
+const BASH_TIMEOUT_MS = 30_000;
+
+/** Keeps the start and the end of command output; the middle of a long
+ *  run is rarely where the answer is, and the ends carry the command
+ *  echo and the error. */
+function clampOutput(text: string): string {
+  if (text.length <= BASH_OUTPUT_CAP) return text;
+  const head = text.slice(0, Math.floor(BASH_OUTPUT_CAP * 0.6));
+  const tail = text.slice(-Math.floor(BASH_OUTPUT_CAP * 0.4));
+  return `${head}\n...[${text.length - head.length - tail.length} characters omitted from the middle]...\n${tail}`;
+}
+
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'read',
@@ -129,6 +148,37 @@ function globToRegExpBody(pattern: string): string {
   return out;
 }
 
+/** A cheap parse check on the languages this harness sees most.
+ *
+ *  "verified by reading it back" was a narrower promise than it
+ *  sounded: it proved the bytes landed, not that the file was usable.
+ *  A model can write JSON with a trailing comma or JavaScript with an
+ *  unclosed brace, get told the write verified, and only find out
+ *  several rounds later when something fails to start. This does not
+ *  judge whether the code is correct - nothing here can - it only
+ *  catches a file that cannot be parsed at all.
+ *
+ *  Returns null when the file parses, or when the type is not one we
+ *  can check. */
+function syntaxProblem(filePath: string, content: string): string | null {
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    if (ext === '.json') {
+      JSON.parse(content);
+      return null;
+    }
+    if (ext === '.js' || ext === '.cjs' || ext === '.mjs') {
+      // Compiles without running: catches unclosed braces, stray
+      // tokens, duplicate const in the same scope.
+      new Function(content);
+      return null;
+    }
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  return null;
+}
+
 function globToRegExp(pattern: string): RegExp {
   return new RegExp('^' + globToRegExpBody(pattern) + '$');
 }
@@ -152,9 +202,17 @@ export class ToolExecutor {
   // answer.
   private mutationCount = 0;
   private readonly bashRunAtMutation = new Map<string, number>();
+  private readonly changed = new Set<string>();
 
   constructor(workingDir: string) {
     this.workingDir = path.resolve(workingDir);
+  }
+
+  /** Files written or edited in this session, relative to the working
+   *  directory. Answering "what did it touch?" used to mean scrolling
+   *  the whole transcript. */
+  changedFiles(): string[] {
+    return [...this.changed].sort();
   }
 
   /** Resolves a user-supplied path against the working dir and refuses anything that escapes it. */
@@ -199,11 +257,29 @@ export class ToolExecutor {
     const resolved = this.resolvePath(filePath);
     const content = await fs.readFile(resolved, 'utf-8');
     this.readFiles.add(resolved);
-    return content;
+
+    // An unbounded read is the fastest way to end a turn. A 480KB log
+    // is about 161,000 tokens against an 8,192 token window, so the
+    // request is rejected outright and the whole turn is lost - and
+    // the model has no way to know a file is too big before asking
+    // for it. Head and tail keep it useful (a log's interesting part
+    // is usually at one end) and the middle is reported, not hidden.
+    if (content.length <= READ_CHAR_CAP) return content;
+    const head = content.slice(0, Math.floor(READ_CHAR_CAP * 0.7));
+    const tail = content.slice(-Math.floor(READ_CHAR_CAP * 0.3));
+    const skippedLines = content.slice(head.length, content.length - tail.length).split('\n').length;
+    return `${head}\n\n...[${filePath} is ${content.length} chars, too large for the context window. `
+      + `${skippedLines} lines omitted from the middle. Use grep() to find a specific part, `
+      + `or bash("sed -n 'START,ENDp' ${filePath}") to read a range.]...\n\n${tail}`;
   }
 
   private async write(filePath: string, content: string): Promise<string> {
     const resolved = this.resolvePath(filePath);
+    // Whether this replaced something, and how much, is the single
+    // most useful fact about a write and it was not being reported.
+    const previous = await fs.readFile(resolved, 'utf-8').catch(() => null);
+    const existed = previous !== null;
+    const previousLength = previous?.length ?? 0;
     await fs.mkdir(path.dirname(resolved), { recursive: true });
     await fs.writeFile(resolved, content, 'utf-8');
     this.readFiles.add(resolved);
@@ -215,7 +291,15 @@ export class ToolExecutor {
       return `error: write to ${filePath} did not verify - disk content does not match what was written`;
     }
     this.mutationCount++;
-    return `wrote ${verify.length} bytes to ${filePath}, verified by reading it back`;
+    this.changed.add(path.relative(this.workingDir, resolved));
+    const problem = syntaxProblem(filePath, verify);
+    const before = existed ? `, replacing ${previousLength} bytes` : ' (new file)';
+    if (problem) {
+      return `wrote ${verify.length} bytes to ${filePath}${before}, but the file does not parse: `
+        + `${problem}. The bytes are on disk; the file is not usable as it stands. Fix it before `
+        + `relying on it.`;
+    }
+    return `wrote ${verify.length} bytes to ${filePath}${before}, verified by reading it back and parsing it`;
   }
 
   private async edit(filePath: string, oldString: string, newString: string): Promise<string> {
@@ -256,7 +340,13 @@ export class ToolExecutor {
       return `error: edit to ${filePath} did not verify - disk content does not match what was written`;
     }
     this.mutationCount++;
-    return `edited ${filePath}, verified by reading it back`;
+    this.changed.add(path.relative(this.workingDir, resolved));
+    const problem = syntaxProblem(filePath, verify);
+    if (problem) {
+      return `edited ${filePath}, but the file no longer parses: ${problem}. The edit is on disk; `
+        + `the file is not usable as it stands. Fix it before relying on it.`;
+    }
+    return `edited ${filePath}, verified by reading it back and parsing it`;
   }
 
   private async bash(command: string): Promise<string> {
@@ -276,15 +366,31 @@ export class ToolExecutor {
     try {
       const { stdout, stderr } = await execAsync(command, {
         cwd: this.workingDir,
-        timeout: 30_000,
-        maxBuffer: 1024 * 1024,
+        timeout: BASH_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024,
       });
-      return `stdout:\n${stdout}${stderr ? `\nstderr:\n${stderr}` : ''}${repeatNote}`;
+      return `stdout:\n${clampOutput(stdout)}${stderr ? `\nstderr:\n${clampOutput(stderr)}` : ''}${repeatNote}`;
     } catch (err: any) {
-      // Real command failures are real information the model needs to see,
-      // not something to swallow into a generic "it worked" - this is
-      // exactly the kind of result today's failures never actually got.
-      return `command failed (exit ${err.code ?? 'unknown'}):\nstdout:\n${err.stdout ?? ''}\nstderr:\n${err.stderr ?? ''}${repeatNote}`;
+      // Three different things arrive here and they used to read
+      // identically as "command failed (exit unknown)" with empty
+      // output, which tells the model nothing it can act on.
+      if (err.killed && err.signal === 'SIGTERM') {
+        return `the command was killed after ${BASH_TIMEOUT_MS / 1000}s, which is the timeout for a `
+          + `foreground command. It did not finish, and whatever it printed before being killed is `
+          + `below - that output does not mean it succeeded. If this is meant to keep running `
+          + `(a server, a watcher), call bash again with background:true.\n`
+          + `stdout:\n${clampOutput(err.stdout ?? '')}\nstderr:\n${clampOutput(err.stderr ?? '')}${repeatNote}`;
+      }
+      if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+        // The command very likely succeeded; it just printed more than
+        // was captured. Reporting that as a failure sent a model off
+        // debugging a command that had worked.
+        return `the command produced more output than can be captured, so it was cut off. This is `
+          + `not a failure of the command itself. Narrow it (grep, head, tail, --quiet) and run it `
+          + `again if you need the content.\nfirst part of stdout:\n${clampOutput(err.stdout ?? '')}${repeatNote}`;
+      }
+      return `command failed (exit ${err.code ?? 'unknown'}):\nstdout:\n${clampOutput(err.stdout ?? '')}`
+        + `\nstderr:\n${clampOutput(err.stderr ?? '')}${repeatNote}`;
     }
   }
 
@@ -362,13 +468,21 @@ export class ToolExecutor {
   }
 
   private async glob(pattern: string): Promise<string> {
+    // Capped for the same reason read is: an unbounded listing of a
+    // real repository is thousands of lines straight into an 8k window.
     const regex = globToRegExp(pattern);
     const entries = await fs.readdir(this.workingDir, { recursive: true, withFileTypes: true });
     const matches = entries
       .filter((e) => e.isFile())
       .map((e) => path.relative(this.workingDir, path.join(e.parentPath ?? this.workingDir, e.name)))
       .filter((rel) => !isIgnoredPath(rel) && regex.test(rel));
-    return matches.length ? matches.join('\n') : '(no matches)';
+    if (!matches.length) return '(no matches)';
+    if (matches.length > GLOB_RESULT_CAP) {
+      return `${matches.slice(0, GLOB_RESULT_CAP).join('\n')}\n`
+        + `...[${matches.length - GLOB_RESULT_CAP} more files matched and are not listed. `
+        + `Narrow the pattern rather than reading this list.]`;
+    }
+    return matches.join('\n');
   }
 
   private async grep(pattern: string, subPath: string): Promise<string> {
