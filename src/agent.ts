@@ -27,7 +27,14 @@ function estimateTokens(text: string): number {
 // Room for the model's own reply plus a small safety margin - not the
 // full context window, or a reply that actually uses maxTokensPerTurn
 // would itself push the total past n_ctx.
-const PROMPT_TOKEN_BUDGET = config.contextSize - config.maxTokensPerTurn - 200;
+// Below this there is no room to say anything useful, so the turn
+// genuinely cannot proceed.
+const MIN_REPLY_TOKENS = 400;
+
+// Trimming only has to get the prompt small enough that a reply fits
+// at all. Reserving the full per-turn maximum here made trimming
+// fight to stay under half the window, and give up early.
+const PROMPT_TOKEN_BUDGET = config.contextSize - MIN_REPLY_TOKENS - 200;
 
 const INITIAL_TOOL_RESULT_CAP = 4000;
 const MIN_TOOL_RESULT_CAP = 200;
@@ -121,18 +128,19 @@ export function trimToBudget(history: Message[], tools: ToolDefinition[], workin
   history.length = 0;
   history.push(...exchanges.flat());
 
-  // Sending a prompt that is known to be over the window wastes a
-  // round trip and loses the turn to a 400. Saying so here at least
-  // names the real cause instead of surfacing the server's error.
-  const finalEstimate = estimateTokens(renderPrompt(history, tools, workingDir));
-  if (finalEstimate > PROMPT_TOKEN_BUDGET) {
-    throw new Error(
-      `history will not fit the context window: about ${finalEstimate} tokens against a `
-      + `${PROMPT_TOKEN_BUDGET} token budget (${config.contextSize} context minus room to reply), `
-      + `and everything that can be trimmed already has been. Start a new session, or raise `
-      + `BRODECODE_CTX_SIZE along with llama-server's --ctx-size.`,
-    );
-  }
+}
+
+/** How many tokens the model may generate, given what the prompt took.
+ *
+ *  Reserving a flat maxTokensPerTurn is what made the previous guard
+ *  so trigger-happy: half the window was held back for a reply that
+ *  usually runs a few hundred tokens, so an ordinary session five
+ *  tool calls in was declared impossible and thrown away. The window
+ *  is shared; the reply gets whatever the prompt left, capped at the
+ *  configured maximum. */
+export function replyBudget(history: Message[], tools: ToolDefinition[], workingDir: string): number {
+  const prompt = estimateTokens(renderPrompt(history, tools, workingDir));
+  return Math.min(config.maxTokensPerTurn, config.contextSize - prompt - 200);
 }
 
 /** Runs one user turn to completion (possibly many tool round-trips),
@@ -161,7 +169,15 @@ export async function* runTurn(
     // line can add: "thinking" on round 2 and "thinking" on round 17
     // of a 20-round limit mean very different things about whether
     // this is going to finish.
-    const raw = await complete(prompt, onToken && ((chunk) => onToken(chunk, turn + 1)), signal);
+    const budget = replyBudget(history, toolDefinitions, tools.workingDir);
+    if (budget < MIN_REPLY_TOKENS) {
+      throw new Error(
+        `the conversation no longer leaves room for a reply inside a ${config.contextSize} token `
+        + `window, and everything that can be trimmed already has been. Start a new session, or `
+        + `raise BRODECODE_CTX_SIZE along with llama-server's --ctx-size.`,
+      );
+    }
+    const raw = await complete(prompt, onToken && ((chunk) => onToken(chunk, turn + 1)), signal, budget);
     const parsed = parseResponse(raw);
 
     if (parsed.thinking) {

@@ -216,6 +216,12 @@ async function main() {
   const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 
   const renderStatus = () => {
+    // The interval added to draw the line early kept firing while
+    // tool results were being printed, so a redraw landed between the
+    // clear and the print and the status line fused onto the output:
+    // "...2411 tok - 33.1sstdout:". It only belongs on screen while
+    // the model is generating.
+    if (!streaming) return;
     spinnerIdx = (spinnerIdx + 1) % spinnerFrames.length;
     // Phase alone answered "is it stuck" and nothing else. Which
     // model is answering, which tool it is reaching for, and how

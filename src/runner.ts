@@ -30,7 +30,7 @@ export async function serverInfo(): Promise<{ model: string; ctx: number } | nul
  *  Streams tokens via onToken as they arrive (so the CLI can show real,
  *  live progress instead of silence followed by a wall of text), and
  *  returns the full accumulated response once generation stops. */
-export async function complete(prompt: string, onToken?: (chunk: string) => void, signal?: AbortSignal): Promise<string> {
+export async function complete(prompt: string, onToken?: (chunk: string) => void, signal?: AbortSignal, maxTokens?: number): Promise<string> {
   let res: Response;
   try {
     res = await fetch(`${config.llamaServerUrl}/completion`, {
@@ -38,7 +38,7 @@ export async function complete(prompt: string, onToken?: (chunk: string) => void
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt,
-        n_predict: config.maxTokensPerTurn,
+        n_predict: maxTokens ?? config.maxTokensPerTurn,
         stop: ['<|im_end|>', '<|im_start|>'],
         stream: true,
       }),
