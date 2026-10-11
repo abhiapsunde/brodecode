@@ -80,15 +80,38 @@ export function trimToBudget(history: Message[], tools: ToolDefinition[], workin
   // (many results each just under the cap can still sum over budget),
   // so shrink the cap and re-check until it actually fits or there's
   // nothing left to cut.
+  //
+  // Tool *calls* have to shrink too, not just tool results. A write()
+  // carries an entire file in its arguments, and renderPrompt emits
+  // those arguments verbatim. Trimming only results left those
+  // payloads untouchable: with the exchange floor at two, a session
+  // that had written a few files could sit permanently over budget
+  // with nothing left that trimming was allowed to cut. Observed
+  // ending a turn with llama-server returning 400, "request (17315
+  // tokens) exceeds the available context size (8192 tokens)".
+  //
+  // The newest exchange is never shrunk - that is the state the model
+  // is reasoning about right now.
   let cap = INITIAL_TOOL_RESULT_CAP;
   while (
     cap >= MIN_TOOL_RESULT_CAP &&
     estimateTokens(renderPrompt(exchanges.flat(), tools, workingDir)) > PROMPT_TOKEN_BUDGET
   ) {
-    for (const group of exchanges) {
+    for (const [i, group] of exchanges.entries()) {
+      const newest = i === exchanges.length - 1;
       for (const m of group) {
         if (m.role === 'tool' && m.content.length > cap) {
           m.content = m.content.slice(0, cap) + '\n...(truncated - too large to fit in context)';
+        }
+        if (!newest && m.role === 'assistant' && m.toolCalls) {
+          for (const tc of m.toolCalls) {
+            for (const [key, value] of Object.entries(tc.arguments)) {
+              if (typeof value === 'string' && value.length > cap) {
+                tc.arguments[key] = value.slice(0, cap)
+                  + `...(truncated, ${value.length} chars originally)`;
+              }
+            }
+          }
         }
       }
     }
@@ -97,6 +120,19 @@ export function trimToBudget(history: Message[], tools: ToolDefinition[], workin
 
   history.length = 0;
   history.push(...exchanges.flat());
+
+  // Sending a prompt that is known to be over the window wastes a
+  // round trip and loses the turn to a 400. Saying so here at least
+  // names the real cause instead of surfacing the server's error.
+  const finalEstimate = estimateTokens(renderPrompt(history, tools, workingDir));
+  if (finalEstimate > PROMPT_TOKEN_BUDGET) {
+    throw new Error(
+      `history will not fit the context window: about ${finalEstimate} tokens against a `
+      + `${PROMPT_TOKEN_BUDGET} token budget (${config.contextSize} context minus room to reply), `
+      + `and everything that can be trimmed already has been. Start a new session, or raise `
+      + `BRODECODE_CTX_SIZE along with llama-server's --ctx-size.`,
+    );
+  }
 }
 
 /** Runs one user turn to completion (possibly many tool round-trips),

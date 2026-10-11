@@ -1,4 +1,4 @@
-import { promises as fs, mkdirSync, openSync } from 'node:fs';
+import { promises as fs, mkdirSync, openSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { exec, spawn } from 'node:child_process';
@@ -297,7 +297,7 @@ export class ToolExecutor {
    *  actually already been killed - and every following curl against
    *  it silently failed. spawn+detach+unref here means the process
    *  genuinely outlives this call, instead of looking like it does. */
-  private bashBackground(command: string): string {
+  private async bashBackground(command: string): Promise<string> {
     const logDir = path.join(os.homedir(), '.brodecode', 'bg');
     mkdirSync(logDir, { recursive: true });
     const logPath = path.join(logDir, `${Date.now()}.log`);
@@ -309,7 +309,56 @@ export class ToolExecutor {
       stdio: ['ignore', fd, fd],
     });
     child.unref();
-    return `started in background (pid ${child.pid}), not waited on - it keeps running after this call returns. Output is being logged to ${logPath}. Verify it's actually working (e.g. curl a server it starts) before assuming it did - a background process can still fail moments after starting. To stop it: bash("kill ${child.pid}").`;
+    const pid = child.pid;
+
+    // Telling the model to go and verify this itself was advice, and
+    // advice is not a mechanism. A server that dies on EADDRINUSE dies
+    // within milliseconds, and reporting that as "started" sent one
+    // session into fifteen minutes of editing a file while an older
+    // process on the same port served stale code and produced the same
+    // error every time. So: wait, then check.
+    await new Promise((r) => setTimeout(r, 700));
+    let alive = false;
+    try {
+      process.kill(pid!, 0);
+      alive = true;
+    } catch {
+      alive = false;
+    }
+
+    const log = (() => {
+      try {
+        return readFileSync(logPath, 'utf-8').trim();
+      } catch {
+        return '';
+      }
+    })();
+
+    if (!alive) {
+      const tail = log.split('\n').slice(-12).join('\n');
+      return `the command exited within 700ms of starting, so nothing is running in the background.\n`
+        + `output:\n${tail || '(nothing was written to the log)'}\n`
+        + `the log is at ${logPath}. Fix the cause before trying again; starting it a second time will fail the same way.`;
+    }
+
+    // A port already held by something else is the specific failure
+    // that is invisible from inside the project directory.
+    const ports = [...command.matchAll(/\b(?:localhost:|:)(\d{2,5})\b/g)].map((m) => m[1]);
+    let portNote = '';
+    for (const port of new Set(ports)) {
+      const owner = await execAsync(`lsof -ti:${port} 2>/dev/null || true`).catch(() => ({ stdout: '' }));
+      const pids = String(owner.stdout).split('\n').filter(Boolean);
+      if (pids.length > 1 || (pids.length === 1 && pids[0] !== String(pid))) {
+        portNote += `\nwarning: port ${port} is held by pid ${pids.join(', ')}, not by the process just started.`
+          + ` Requests to that port are being answered by something else, which may be running older code.`;
+      }
+    }
+
+    const first = log.split('\n').slice(0, 4).join('\n');
+    return `started in background (pid ${pid}), still alive after 700ms.`
+      + `${first ? `\nfirst output:\n${first}` : ''}`
+      + `${portNote}`
+      + `\nOutput is being logged to ${logPath}. Still worth curling it before assuming it works. To stop it: bash("kill ${pid}").`;
   }
 
   private async glob(pattern: string): Promise<string> {
